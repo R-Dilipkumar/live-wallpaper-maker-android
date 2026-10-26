@@ -24,6 +24,76 @@ float hash12(vec2 p) {
 }
 """
 
+  /** Layer masks (shape cut-outs and edge fades) and the time-of-day colour, shared by layer and gradient shaders. */
+  private const val MASK_AND_DAY = """
+uniform int uMask;          // 0 none, 1 circle, 2 rounded, 3 heart, 4 star, 5 soft edges, 6 fade top, 7 fade bottom
+uniform float uFeather;     // 0..1
+uniform vec4 uDay;          // rgb tint, amount
+uniform float uDim;
+
+float dot2(vec2 v) { return dot(v, v); }
+
+float sdHeart(vec2 p) {
+  p.x = abs(p.x);
+  if (p.y + p.x > 1.0) return sqrt(dot2(p - vec2(0.25, 0.75))) - sqrt(2.0) / 4.0;
+  return sqrt(min(dot2(p - vec2(0.00, 1.00)), dot2(p - 0.5 * max(p.x + p.y, 0.0)))) * sign(p.x - p.y);
+}
+
+float sdStar5(vec2 p, float r, float rf) {
+  const vec2 k1 = vec2(0.809016994375, -0.587785252292);
+  const vec2 k2 = vec2(-k1.x, k1.y);
+  p.x = abs(p.x);
+  p -= 2.0 * max(dot(k1, p), 0.0) * k1;
+  p -= 2.0 * max(dot(k2, p), 0.0) * k2;
+  p.x = abs(p.x);
+  p.y -= r;
+  vec2 ba = rf * vec2(-k1.y, k1.x) - vec2(0.0, 1.0);
+  float h = clamp(dot(p, ba) / dot(ba, ba), 0.0, r);
+  return length(p - ba * h) * sign(p.y * ba.x - p.x * ba.y);
+}
+
+/** Mask coverage 0..1 at layer position uv (GL convention) for a layer of size px. */
+float maskAlpha(vec2 uv, vec2 size) {
+  if (uMask == 0) return 1.0;
+  vec2 q = vec2(uv.x, 1.0 - uv.y);
+  float f = max(uFeather, 0.002);
+  float s = min(size.x, size.y);
+  vec2 sq = vec2((q.x - 0.5) * size.x / s, (0.5 - q.y) * size.y / s);  // square units, y up
+  if (uMask == 1) {
+    float d = length(sq) - 0.5;
+    return 1.0 - smoothstep(-f * 0.5, 0.0, d);
+  }
+  if (uMask == 2) {
+    vec2 h = 0.5 * size / s;
+    float rad = 0.12;
+    vec2 d = abs(sq) - (h - rad);
+    float dist = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - rad;
+    return 1.0 - smoothstep(-f * 0.25, 0.0, dist);
+  }
+  if (uMask == 3) {
+    float d = sdHeart(sq * 1.25 + vec2(0.0, 0.5));
+    return 1.0 - smoothstep(-f * 0.3 - 0.004, 0.0, d);
+  }
+  if (uMask == 4) {
+    float d = sdStar5(sq, 0.48, 0.45);
+    return 1.0 - smoothstep(-f * 0.2 - 0.004, 0.0, d);
+  }
+  if (uMask == 5) {
+    float e = min(min(q.x, 1.0 - q.x) * size.x, min(q.y, 1.0 - q.y) * size.y) / s;
+    return smoothstep(0.0, f * 0.5 + 0.02, e);
+  }
+  if (uMask == 6) return smoothstep(0.0, f * 1.5 + 0.05, q.y);
+  if (uMask == 7) return smoothstep(0.0, f * 1.5 + 0.05, 1.0 - q.y);
+  return 1.0;
+}
+
+vec3 applyDay(vec3 rgb) {
+  if (uDay.a <= 0.0 && uDim <= 0.0) return rgb;
+  vec3 t = uDay.rgb / max(max(uDay.r, uDay.g), max(uDay.b, 0.001));
+  return mix(rgb, rgb * t, uDay.a) * (1.0 - uDim);
+}
+"""
+
   /** Media/text layers: sampling plus every per-layer effect, in one pass. */
   fun layerFs(oes: Boolean): String {
     val header = if (oes) {
@@ -31,7 +101,7 @@ float hash12(vec2 p) {
     } else {
       "#version 300 es\nprecision highp float;\nuniform sampler2D uTex;\n"
     }
-    return header + COMMON + """
+    return header + COMMON + MASK_AND_DAY + """
 in vec2 vUv;
 uniform mat4 uTexMatrix;
 uniform float uOpacity;
@@ -97,8 +167,9 @@ void main() {
   if (uFx.y > 0.0) {
     rgb += (hash12(vUv * uSize + fract(uTime * 7.31) * 517.0) - 0.5) * uFx.y * 0.35;
   }
-  rgb = clamp(rgb, 0.0, 1.0);
-  float outA = a * uOpacity;
+  rgb = clamp(applyDay(rgb), 0.0, 1.0);
+  float outA = a * uOpacity * maskAlpha(vUv, uSize);
+  if (outA < 0.002) discard;
   fragColor = vec4(rgb * outA, outA);
 }
 """
@@ -106,7 +177,7 @@ void main() {
 
   val GRADIENT_FS = """#version 300 es
 precision highp float;
-""" + COMMON + """
+""" + COMMON + MASK_AND_DAY + """
 in vec2 vUv;
 uniform vec4 uColors[4];
 uniform int uCount;
@@ -141,9 +212,96 @@ void main() {
     t = 1.0 - abs(2.0 * x - 1.0);
   }
   vec4 c = ramp(t);
-  vec3 rgb = c.rgb + (hash12(gl_FragCoord.xy) - 0.5) / 255.0;
-  float a = c.a * uOpacity;
+  vec3 rgb = applyDay(c.rgb) + (hash12(gl_FragCoord.xy) - 0.5) / 255.0;
+  float a = c.a * uOpacity * maskAlpha(vUv, uSize);
   fragColor = vec4(rgb * a, a);
+}
+"""
+
+  /** Water ripples from taps: bends the finished scene around expanding rings. */
+  val RIPPLE_FS = """#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uScene;
+uniform vec4 uRipples[6];   // centre (uv), age 0..1, strength
+uniform int uCount;
+uniform vec2 uSize;
+out vec4 fragColor;
+void main() {
+  vec2 asp = vec2(uSize.x / uSize.y, 1.0);
+  vec2 offset = vec2(0.0);
+  float light = 0.0;
+  for (int i = 0; i < 6; i++) {
+    if (i >= uCount) break;
+    vec4 r = uRipples[i];
+    vec2 d = (vUv - r.xy) * asp;
+    float dist = length(d);
+    float radius = r.z * 0.75;
+    float x = dist - radius;
+    float fade = (1.0 - r.z) * (1.0 - r.z) * r.w;
+    float wave = sin(x * 70.0) * exp(-x * x * 160.0) * fade;
+    vec2 dir = dist > 0.0001 ? d / dist : vec2(0.0);
+    offset += dir / asp * wave * 0.018;
+    light += wave * 0.12;
+  }
+  vec4 c = texture(uScene, vUv + offset);
+  fragColor = vec4(c.rgb + light, 1.0);
+}
+"""
+
+  /** Sparks flying out of a tap (points built from gl_VertexID). */
+  const val BURST_VS = """#version 300 es
+uniform mat4 uMvp;
+uniform vec2 uOrigin;   // pixels
+uniform float uAge;     // seconds
+uniform float uScale;   // pixel scale for this screen
+out float vAlpha;
+out float vSeed;
+float h(float n) { return fract(sin(n * 91.3458 + 17.17) * 47453.5453); }
+void main() {
+  float id = float(gl_VertexID);
+  float a = h(id) * 6.2831853;
+  float sp = (180.0 + 520.0 * h(id + 3.1)) * uScale;
+  float t = uAge;
+  vec2 dir = vec2(cos(a), sin(a));
+  vec2 p = uOrigin + dir * sp * t * (1.0 - 0.45 * t) + vec2(0.0, 260.0 * uScale) * t * t;
+  float life = 0.7 + 0.6 * h(id + 7.7);
+  float k = clamp(t / life, 0.0, 1.0);
+  vAlpha = pow(1.0 - k, 1.6) * (0.6 + 0.4 * sin(t * 30.0 + id));
+  vSeed = h(id + 9.9);
+  gl_Position = uMvp * vec4(p, 0.0, 1.0);
+  gl_PointSize = (6.0 + 10.0 * h(id + 5.5)) * uScale * (1.0 - 0.5 * k);
+}
+"""
+
+  const val BURST_FS = """#version 300 es
+precision mediump float;
+in float vAlpha;
+in float vSeed;
+uniform vec4 uColor;
+out vec4 fragColor;
+void main() {
+  vec2 pc = gl_PointCoord - 0.5;
+  float d = length(pc);
+  float star = max(smoothstep(0.08, 0.0, abs(pc.x)) * smoothstep(0.5, 0.0, abs(pc.y)),
+                   smoothstep(0.08, 0.0, abs(pc.y)) * smoothstep(0.5, 0.0, abs(pc.x)));
+  float a = (smoothstep(0.5, 0.0, d) * 0.7 + star * 0.6) * vAlpha * uColor.a;
+  vec3 rgb = mix(uColor.rgb, vec3(1.0), 0.35 * vSeed);
+  fragColor = vec4(rgb * a, a);
+}
+"""
+
+  /** A soft light that blooms where you tap. */
+  const val GLOW_FS = """#version 300 es
+precision mediump float;
+in vec2 vUv;
+uniform vec4 uColor;
+uniform float uFade;
+out vec4 fragColor;
+void main() {
+  float d = length(vUv - 0.5) * 2.0;
+  float a = exp(-d * d * 4.0) * (1.0 - smoothstep(0.85, 1.0, d)) * uFade * uColor.a;
+  fragColor = vec4(uColor.rgb * a, a);
 }
 """
 

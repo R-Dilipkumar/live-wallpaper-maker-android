@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.BitmapFactory
+import android.os.Build
 import android.os.Bundle
 import android.os.FileObserver
 import android.os.PowerManager
@@ -15,6 +16,7 @@ import android.service.wallpaper.WallpaperService
 import android.view.SurfaceHolder
 import androidx.core.content.ContextCompat
 import io.github.rdilipkumar.livewallpapermaker.data.Templates
+import io.github.rdilipkumar.livewallpapermaker.engine.ScreenMode
 import io.github.rdilipkumar.livewallpapermaker.engine.TriggerEvent
 import io.github.rdilipkumar.livewallpapermaker.engine.WallpaperRenderer
 import io.github.rdilipkumar.livewallpapermaker.engine.model.ActiveWallpaper
@@ -49,6 +51,8 @@ class LiveWallpaperService : WallpaperService() {
         when (intent.action) {
           Intent.ACTION_USER_PRESENT -> r.trigger(TriggerEvent.UNLOCK)
           Intent.ACTION_SCREEN_ON -> r.trigger(TriggerEvent.SCREEN_ON)
+          Intent.ACTION_SCREEN_OFF -> r.trigger(TriggerEvent.SCREEN_OFF)
+          Intent.ACTION_BATTERY_LOW, Intent.ACTION_BATTERY_OKAY -> r.trigger(TriggerEvent.POWER_CHANGED)
           Intent.ACTION_POWER_CONNECTED, Intent.ACTION_POWER_DISCONNECTED -> r.trigger(TriggerEvent.POWER_CHANGED)
           PowerManager.ACTION_POWER_SAVE_MODE_CHANGED -> pushPower()
         }
@@ -69,6 +73,9 @@ class LiveWallpaperService : WallpaperService() {
       val filter = IntentFilter().apply {
         addAction(Intent.ACTION_USER_PRESENT)
         addAction(Intent.ACTION_SCREEN_ON)
+        addAction(Intent.ACTION_SCREEN_OFF)
+        addAction(Intent.ACTION_BATTERY_LOW)
+        addAction(Intent.ACTION_BATTERY_OKAY)
         addAction(Intent.ACTION_POWER_CONNECTED)
         addAction(Intent.ACTION_POWER_DISCONNECTED)
         addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
@@ -76,6 +83,24 @@ class LiveWallpaperService : WallpaperService() {
       ContextCompat.registerReceiver(this@LiveWallpaperService, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
       runCatching { power.addThermalStatusListener(mainExecutor, thermalListener) }
       pushPower()
+      pushScreenMode()
+    }
+
+    /** Android 14+ can give the lock screen and home screen separate wallpapers; tell the engine which one this is. */
+    private fun pushScreenMode() {
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return
+      val flags = runCatching { wallpaperFlags }.getOrDefault(-1)
+      val mode = when (flags) {
+        WallpaperManager.FLAG_LOCK -> ScreenMode.LOCK_ONLY
+        WallpaperManager.FLAG_SYSTEM -> ScreenMode.HOME_ONLY
+        else -> ScreenMode.BOTH
+      }
+      renderer?.setScreenMode(mode)
+    }
+
+    override fun onWallpaperFlagsChanged(which: Int) {
+      super.onWallpaperFlagsChanged(which)
+      pushScreenMode()
     }
 
     private fun loadActive() {
@@ -119,6 +144,7 @@ class LiveWallpaperService : WallpaperService() {
 
     override fun onCommand(action: String?, x: Int, y: Int, z: Int, extras: Bundle?, resultRequested: Boolean): Bundle? {
       if (action == WallpaperManager.COMMAND_TAP) {
+        renderer?.touch(x.toFloat(), y.toFloat())
         val now = SystemClock.uptimeMillis()
         val close = hypot(x - lastTapX, y - lastTapY) < 150f
         if (now - lastTapAt < 400L && close) {

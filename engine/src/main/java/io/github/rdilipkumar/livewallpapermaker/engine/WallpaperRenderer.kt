@@ -1,5 +1,6 @@
 package io.github.rdilipkumar.livewallpapermaker.engine
 
+import android.app.KeyguardManager
 import android.content.Context
 import android.opengl.EGLSurface
 import android.os.BatteryManager
@@ -13,7 +14,10 @@ import android.view.Choreographer
 import io.github.rdilipkumar.livewallpapermaker.engine.gl.EglCore
 import io.github.rdilipkumar.livewallpapermaker.engine.gl.Fbo
 import io.github.rdilipkumar.livewallpapermaker.engine.model.BatteryBehavior
+import io.github.rdilipkumar.livewallpapermaker.engine.model.Conditions
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Direction
+import io.github.rdilipkumar.livewallpapermaker.engine.model.TouchKind
+import io.github.rdilipkumar.livewallpapermaker.engine.render.TouchFx
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Geometry
 import io.github.rdilipkumar.livewallpapermaker.engine.model.MotionInput
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Project
@@ -32,7 +36,10 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
 
-enum class TriggerEvent { UNLOCK, DOUBLE_TAP, POWER_CHANGED, SCREEN_ON }
+enum class TriggerEvent { UNLOCK, DOUBLE_TAP, POWER_CHANGED, SCREEN_ON, SCREEN_OFF }
+
+/** Where this wallpaper instance shows: both screens, or only one (Android 14+ can use separate wallpapers). */
+enum class ScreenMode { BOTH, LOCK_ONLY, HOME_ONLY }
 
 /**
  * Plays a [Project] on a surface (the wallpaper's, or the editor's preview).
@@ -74,6 +81,14 @@ class WallpaperRenderer(
   private var swipe = 0.5f
   private var shadeZoom = 0f
   private var autoScenes = true
+  private var screenMode = ScreenMode.BOTH
+  private var simulatedLock: Boolean? = null
+  private var timeOverride: Int? = null
+  private var batteryOverride: Int? = null
+  private val keyguard = appContext.getSystemService(KeyguardManager::class.java)
+  private class Touch(val x: Float, val y: Float, val startClock: Double)
+  private val touches = ArrayList<Touch>()
+  private var fboScene: Fbo? = null
   private var tiltAllowed = true
   private var manualTilt: Pair<Float, Float>? = null
   private val tilt = TiltSensor(appContext, handler) { requestFrame() }
@@ -160,6 +175,45 @@ class WallpaperRenderer(
       dirty = true
       requestFrame()
     }
+  }
+
+  fun setScreenMode(mode: ScreenMode) = handler.post {
+    if (mode != screenMode) {
+      screenMode = mode
+      project?.let { checkSceneRules(it, force = true) }
+      requestFrame()
+    }
+  }
+
+  /** Editor: pretend the lock screen is (true) or isn't (false) showing; null = real state. */
+  fun setSimulatedLock(locked: Boolean?) = handler.post {
+    simulatedLock = locked
+    project?.let { checkSceneRules(it, force = true) }
+    requestFrame()
+  }
+
+  /** Editor: pretend it is this minute of the day (null = real time). Affects time rules and day colours. */
+  fun setTimeOverride(minuteOfDay: Int?) = handler.post {
+    timeOverride = minuteOfDay
+    project?.let { checkSceneRules(it, force = true) }
+    dirty = true
+    requestFrame()
+  }
+
+  /** Editor: pretend the battery is at this level (null = real). */
+  fun setBatteryOverride(percent: Int?) = handler.post {
+    batteryOverride = percent
+    project?.let { checkSceneRules(it, force = true) }
+    requestFrame()
+  }
+
+  /** A tap at [x],[y] (surface pixels): plays the project's tap effect. */
+  fun touch(x: Float, y: Float) = handler.post {
+    val p = project ?: return@post
+    if (p.settings.touch.kind == TouchKind.NONE) return@post
+    touches += Touch(x, y, clockMs)
+    while (touches.size > 6) touches.removeAt(0)
+    requestFrame()
   }
 
   /** How far the notification shade is pulled down (0..1). The wallpaper zooms in a little when enabled. */
@@ -315,6 +369,7 @@ class WallpaperRenderer(
       drawer?.release()
       fboFrom?.release()
       fboTo?.release()
+      fboScene?.release()
       painter?.release()
       egl?.releaseSurface(pbuffer!!)
       egl?.release()
@@ -380,7 +435,7 @@ class WallpaperRenderer(
       transition = null
     }
     if (current == null) {
-      val scene = if (autoScenes) SceneLogic.pickScene(p, minuteOfDay(), isCharging(), null) else p.scenes.firstOrNull()
+      val scene = if (autoScenes) SceneLogic.pickScene(p, conditions(), null) else p.scenes.firstOrNull()
       if (scene != null) {
         current = Showing(scene.id, clockMs)
         lastSwitchClock = clockMs
@@ -422,7 +477,7 @@ class WallpaperRenderer(
     val p = project ?: return
     if (!visible) return
     val clockText = scenesOnScreen(p).any { s -> sources?.hasClockText(s.id) == true }
-    if (!clockText) return
+    if (!clockText && p.settings.dayCycle <= 0f) return
     val now = System.currentTimeMillis()
     handler.postDelayed(minuteTick, 60_000L - now % 60_000L + 50L)
   }
@@ -476,7 +531,8 @@ class WallpaperRenderer(
     if (src.refreshTexts(System.currentTimeMillis(), onScreen.map { it.id }.toSet())) dirty = true
 
     val transitioning = next != null
-    val animated = !frozen && (transitioning || onScreen.any { SceneLogic.sceneIsAnimated(it, p) })
+    touches.removeAll { clockMs - it.startClock > touchLifeMs(p) }
+    val animated = !frozen && (transitioning || touches.isNotEmpty() || onScreen.any { SceneLogic.sceneIsAnimated(it, p) })
     val due = interval == null || frameNanos - lastDrawNanos >= interval - 2_000_000L
     if ((dirty || newFrame || animated) && due) {
       draw(p)
@@ -496,7 +552,7 @@ class WallpaperRenderer(
     if (!autoScenes) return
     var waitMs = Double.MAX_VALUE
     val timer = p.switching.timerSec
-    if (timer > 0 && SceneLogic.eligibleScenes(p, minuteOfDay(), isCharging()).size > 1) {
+    if (timer > 0 && SceneLogic.eligibleScenes(p, conditions()).size > 1) {
       waitMs = minOf(waitMs, lastSwitchClock + timer * 1000.0 - clockMs)
     }
     if (introReturnId != null && introEndsAt >= 0) waitMs = minOf(waitMs, introEndsAt - clockMs)
@@ -530,6 +586,16 @@ class WallpaperRenderer(
     if (width <= 0 || height <= 0) return
     pt.setScreenWidth(width)
     pt.screenZoom = if (p.settings.zoomOnShade) 1f + 0.07f * shadeZoom else 1f
+    pt.dayTint = if (p.settings.dayCycle > 0f) SceneLogic.dayTint(minuteOfDay(), p.settings.dayCycle) else null
+    val touch = p.settings.touch
+    val fx = activeTouches(p)
+    val ripple = touch.kind == TouchKind.RIPPLE && fx.isNotEmpty()
+    // With water ripples the finished picture goes to a buffer first, then gets bent on the way to the screen.
+    val out = if (ripple) {
+      val f = ensureFbo(fboScene, false).also { fboScene = it }
+      Target(f, width, height)
+    } else Target(null, width, height)
+
     val cur = current?.let { p.scene(it.sceneId) }
     val nxt = next?.let { p.scene(it.sceneId) }
     val tr = transition
@@ -546,17 +612,44 @@ class WallpaperRenderer(
         from.generateMipmaps()
         to.generateMipmaps()
       }
-      pt.use(Target(null, width, height))
+      pt.use(out)
       drawTransition(pt, tr, progress, from, to)
     } else if (cur != null) {
-      pt.use(Target(null, width, height))
+      pt.use(out)
       dr.draw(cur, p, motionFor(cur.id), width, height)
     } else {
-      pt.use(Target(null, width, height))
+      pt.use(out)
       pt.clear(0xFF000000.toInt())
+    }
+    if (ripple) {
+      pt.use(Target(null, width, height))
+      pt.drawRipples(out.fbo!!.texture, fx, touch.size.coerceIn(0.3f, 2.5f))
+    } else if (fx.isNotEmpty()) {
+      pt.use(Target(null, width, height))
+      for (t in fx) when (touch.kind) {
+        TouchKind.SPARKLES -> pt.drawSparkles(t, touch.color, touch.size)
+        TouchKind.GLOW -> pt.drawGlow(t, touch.color, touch.size)
+        else -> Unit
+      }
     }
     sceneTimeSec = motionFor(current?.sceneId ?: "").timeSec
     core.swap(win)
+  }
+
+  private fun touchLifeMs(p: Project): Double = when (p.settings.touch.kind) {
+    TouchKind.RIPPLE -> 1800.0
+    TouchKind.SPARKLES -> 1500.0
+    TouchKind.GLOW -> 1300.0
+    TouchKind.NONE -> 0.0
+  }
+
+  private fun activeTouches(p: Project): List<TouchFx> {
+    val life = touchLifeMs(p)
+    if (life <= 0.0 || touches.isEmpty()) return emptyList()
+    return touches.mapNotNull { t ->
+      val age = clockMs - t.startClock
+      if (age < 0 || age > life) null else TouchFx(t.x, t.y, (age / life).toFloat(), (age / 1000.0).toFloat())
+    }
   }
 
   private fun ensureFbo(existing: Fbo?, mipmap: Boolean): Fbo {
@@ -655,7 +748,7 @@ class WallpaperRenderer(
       if (introEndsAt >= 0 && clockMs >= introEndsAt) {
         introReturnId = null
         introEndsAt = -1.0
-        val back = p.scene(returnId) ?: SceneLogic.pickScene(p, minuteOfDay(), isCharging(), null)
+        val back = p.scene(returnId) ?: SceneLogic.pickScene(p, conditions(), null)
         if (back != null) goTo(back, p)
       }
       return
@@ -663,7 +756,7 @@ class WallpaperRenderer(
 
     val timer = p.switching.timerSec
     if (timer > 0 && clockMs - lastSwitchClock >= timer * 1000.0) {
-      SceneLogic.nextScene(p, cur.sceneId, minuteOfDay(), isCharging())?.let { goTo(it, p) }
+      SceneLogic.nextScene(p, cur.sceneId, conditions())?.let { goTo(it, p) }
       lastSwitchClock = clockMs
       return
     }
@@ -680,8 +773,21 @@ class WallpaperRenderer(
     val cur = current ?: return
     val curScene = p.scene(cur.sceneId) ?: return
     if (curScene.isIntro) return
-    val eligible = SceneLogic.eligibleScenes(p, minuteOfDay(), isCharging())
-    if (eligible.none { it.id == cur.sceneId }) eligible.firstOrNull()?.let { goTo(it, p) }
+    val eligible = SceneLogic.eligibleScenes(p, conditions())
+    if (eligible.none { it.id == cur.sceneId }) eligible.firstOrNull()?.let { if (visible) goTo(it, p) else switchInstantly(it, p) }
+  }
+
+  /** Changes scene with no transition (used while the wallpaper can't be seen, e.g. screen off). */
+  private fun switchInstantly(scene: Scene, p: Project) {
+    finishTransitionNow(p)
+    if (current?.sceneId == scene.id) return
+    current = Showing(scene.id, clockMs)
+    currentSceneId = scene.id
+    lastSwitchClock = clockMs
+    sources?.prepare(scene, p)
+    releaseUnused(p)
+    updateTiltSensor()
+    dirty = true
   }
 
   private fun goTo(scene: Scene, p: Project) {
@@ -723,32 +829,50 @@ class WallpaperRenderer(
     if (!autoScenes) return
     when (event) {
       TriggerEvent.UNLOCK -> {
+        if (simulatedLock == true) simulatedLock = false
         val intro = SceneLogic.introScene(p)
         if (intro != null) {
-          val back = next?.sceneId ?: current?.sceneId
-          if (back != null && back != intro.id) {
-            introReturnId = back
+          // After the intro, go to the scene meant for the home screen (it may differ from the lock-screen one).
+          val home = SceneLogic.pickScene(p, conditions(), next?.sceneId ?: current?.sceneId)?.id
+            ?: next?.sceneId ?: current?.sceneId
+          if (home != null && home != intro.id) {
+            introReturnId = home
             introEndsAt = -1.0
             goTo(intro, p)
             return
           }
         }
         if (p.switching.onUnlock) {
-          SceneLogic.nextScene(p, current?.sceneId, minuteOfDay(), isCharging())?.let { goTo(it, p) }
+          SceneLogic.nextScene(p, current?.sceneId, conditions())?.let { goTo(it, p) }
+        } else {
+          checkSceneRules(p, force = true)
         }
       }
       TriggerEvent.DOUBLE_TAP -> if (p.switching.onDoubleTap) {
-        SceneLogic.nextScene(p, current?.sceneId, minuteOfDay(), isCharging())?.let { goTo(it, p) }
+        SceneLogic.nextScene(p, current?.sceneId, conditions())?.let { goTo(it, p) }
       }
-      TriggerEvent.POWER_CHANGED, TriggerEvent.SCREEN_ON -> checkSceneRules(p, force = true)
+      TriggerEvent.POWER_CHANGED, TriggerEvent.SCREEN_ON, TriggerEvent.SCREEN_OFF -> checkSceneRules(p, force = true)
     }
     requestFrame()
   }
 
   private fun minuteOfDay(): Int {
+    timeOverride?.let { return it }
     val c = Calendar.getInstance()
     return c.get(Calendar.HOUR_OF_DAY) * 60 + c.get(Calendar.MINUTE)
   }
+
+  private fun isLocked(): Boolean = simulatedLock ?: when (screenMode) {
+    ScreenMode.LOCK_ONLY -> true
+    ScreenMode.HOME_ONLY -> false
+    ScreenMode.BOTH -> runCatching { keyguard?.isKeyguardLocked == true }.getOrDefault(false)
+  }
+
+  private fun batteryLevel(): Int = batteryOverride ?: runCatching {
+    appContext.getSystemService(BatteryManager::class.java)?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+  }.getOrNull()?.takeIf { it in 0..100 } ?: 100
+
+  private fun conditions(): Conditions = Conditions(minuteOfDay(), isCharging(), isLocked(), batteryLevel())
 
   private fun isCharging(): Boolean =
     runCatching { appContext.getSystemService(BatteryManager::class.java)?.isCharging == true }.getOrDefault(false)

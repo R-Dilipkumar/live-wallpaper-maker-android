@@ -2,6 +2,7 @@ package io.github.rdilipkumar.livewallpapermaker.engine.render
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.ImageDecoder
 import android.graphics.SurfaceTexture
@@ -9,6 +10,8 @@ import android.graphics.Typeface
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.opengl.GLES30
+import android.opengl.GLUtils
 import android.opengl.Matrix
 import android.os.Handler
 import android.text.Layout
@@ -17,6 +20,7 @@ import android.text.TextPaint
 import android.util.Log
 import android.view.Surface
 import io.github.rdilipkumar.livewallpapermaker.engine.gl.Gl
+import io.github.rdilipkumar.livewallpapermaker.engine.model.StickerInfo
 import io.github.rdilipkumar.livewallpapermaker.engine.model.TextFont
 import io.github.rdilipkumar.livewallpapermaker.engine.model.TextSpec
 import java.io.File
@@ -269,9 +273,72 @@ internal class VideoSource(
   }
 }
 
+/** An animated transparent sticker: one sheet texture, the visible frame chosen by time. */
+internal class StickerSource(file: File, private val info: StickerInfo) : FrameSource {
+  override val oes = false
+  override val texMatrix: FloatArray = FloatArray(16)
+  override var texture = 0; private set
+  override val width = info.frameW
+  override val height = info.frameH
+  override var frameCounter = 0L; private set
+  override var ready = false; private set
+  private var sheetW = 1
+  private var sheetH = 1
+  private var frame = -1
+
+  init {
+    try {
+      val bmp = BitmapFactory.decodeFile(file.path) ?: throw IllegalStateException("bad sheet")
+      sheetW = bmp.width
+      sheetH = bmp.height
+      texture = Gl.createTexture()
+      GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texture)
+      GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, bmp, 0)
+      bmp.recycle()
+      ready = true
+      setTime(0)
+    } catch (t: Throwable) {
+      Log.w("LwmSticker", "Could not load ${file.name}", t)
+    }
+  }
+
+  /** Picks the frame showing at [ms]; returns true if it changed. */
+  fun setTime(ms: Long): Boolean {
+    val delays = info.delays.ifEmpty { listOf(100) }
+    var t = Math.floorMod(ms, info.totalMs.toLong()).toInt()
+    var index = 0
+    while (index < delays.size - 1 && t >= delays[index]) {
+      t -= delays[index]
+      index++
+    }
+    if (index == frame) return false
+    frame = index
+    val col = index % info.cols
+    val row = index / info.cols
+    val x0 = info.pad + col * (info.frameW + info.pad)
+    val y0 = info.pad + row * (info.frameH + info.pad)
+    Matrix.setIdentityM(texMatrix, 0)
+    texMatrix[0] = info.frameW.toFloat() / sheetW
+    texMatrix[5] = -info.frameH.toFloat() / sheetH
+    texMatrix[12] = x0.toFloat() / sheetW
+    texMatrix[13] = (y0 + info.frameH).toFloat() / sheetH
+    frameCounter++
+    return true
+  }
+
+  override fun release() {
+    Gl.deleteTexture(texture)
+    texture = 0
+  }
+}
+
 /** Text drawn once into a texture; re-drawn when a {time}/{date} token changes. */
-internal class TextSource(private val context: Context, private var spec: TextSpec, private var screenH: Int) :
-  FrameSource {
+internal class TextSource(
+  private val context: Context,
+  private var spec: TextSpec,
+  private var screenH: Int,
+  private val fontFile: (String) -> File?,
+) : FrameSource {
   override val oes = false
   override val texMatrix: FloatArray = Gl.FLIP_V
   override var texture = 0; private set
@@ -296,7 +363,7 @@ internal class TextSource(private val context: Context, private var spec: TextSp
     val text = TextRenderer.format(context, spec.text, nowMs)
     if (text == rendered) return false
     rendered = text
-    val bmp = TextRenderer.render(spec, screenH, text)
+    val bmp = TextRenderer.render(spec, screenH, text, spec.fontAsset?.let(fontFile))
     texture = Gl.uploadBitmap(bmp, texture)
     width = bmp.width
     height = bmp.height
@@ -317,9 +384,76 @@ internal class TextSource(private val context: Context, private var spec: TextSp
 
 /** Draws text layers. Shared by the wallpaper and the editor (which needs the same size for its selection box). */
 object TextRenderer {
-  val TOKENS = listOf("{time}", "{date}", "{day}", "{month}", "{year}", "{hour}", "{minute}")
+  val TOKENS = listOf("{time}", "{date}", "{day}", "{month}", "{year}", "{hour}", "{minute}", "{battery}", "{quote}", "{countdown:")
 
-  fun typeface(font: TextFont, bold: Boolean): Typeface {
+  private val COUNTDOWN = Regex("\\{countdown:(\\d{4})-(\\d{2})-(\\d{2})\\}")
+
+  /** Short, timeless sayings; one per day. */
+  val QUOTES = listOf(
+    "Well begun is half done.",
+    "Every day is a fresh start.",
+    "Small steps, every day.",
+    "Stay curious.",
+    "Breathe. You're doing fine.",
+    "Make today count.",
+    "Be kind to yourself.",
+    "Slow progress is still progress.",
+    "Fortune favours the bold.",
+    "Dream big, start small.",
+    "Do one thing at a time.",
+    "Rest is part of the work.",
+    "Keep going.",
+    "Begin anywhere.",
+    "Less, but better.",
+    "Little by little, a little becomes a lot.",
+    "The best time to start is now.",
+    "Be here now.",
+    "Done is better than perfect.",
+    "Look up at the stars.",
+    "Choose joy.",
+    "Light follows the dark.",
+    "Make it simple.",
+    "Trust the process.",
+    "You've got this.",
+    "Water wears down stone.",
+    "Leave it better than you found it.",
+    "Enjoy the little things.",
+    "One day or day one.",
+    "Grow through what you go through.",
+  )
+
+  /** The quote for the given day (same all day, different tomorrow). */
+  fun quoteFor(nowMs: Long): String {
+    val day = Math.floorDiv(nowMs + java.util.TimeZone.getDefault().getOffset(nowMs), 86_400_000L)
+    return QUOTES[Math.floorMod(day, QUOTES.size.toLong()).toInt()]
+  }
+
+  /** "12 days", "1 day", "Today", or "3 days ago" until the date. */
+  fun countdown(nowMs: Long, year: Int, month: Int, day: Int): String {
+    val today = java.util.Calendar.getInstance().apply {
+      timeInMillis = nowMs
+      set(java.util.Calendar.HOUR_OF_DAY, 12); set(java.util.Calendar.MINUTE, 0); set(java.util.Calendar.SECOND, 0); set(java.util.Calendar.MILLISECOND, 0)
+    }
+    val target = java.util.Calendar.getInstance().apply {
+      clear()
+      set(year, month - 1, day, 12, 0, 0)
+    }
+    val days = Math.round((target.timeInMillis - today.timeInMillis) / 86_400_000.0).toInt()
+    return when {
+      days == 0 -> "Today"
+      days == 1 -> "1 day"
+      days > 1 -> "$days days"
+      days == -1 -> "1 day ago"
+      else -> "${-days} days ago"
+    }
+  }
+
+  fun typeface(font: TextFont, bold: Boolean, fontFile: File? = null): Typeface {
+    if (fontFile != null && fontFile.exists()) {
+      runCatching { Typeface.createFromFile(fontFile) }.getOrNull()?.let { tf ->
+        return if (bold) Typeface.create(tf, Typeface.BOLD) else tf
+      }
+    }
     val style = if (bold) Typeface.BOLD else Typeface.NORMAL
     return when (font) {
       TextFont.SANS -> Typeface.create(Typeface.SANS_SERIF, style)
@@ -336,7 +470,7 @@ object TextRenderer {
     val locale = Locale.getDefault()
     val is24 = android.text.format.DateFormat.is24HourFormat(context)
     fun f(pattern: String) = SimpleDateFormat(pattern, locale).format(date)
-    return template
+    var out = template
       .replace("{time}", f(if (is24) "HH:mm" else "h:mm"))
       .replace("{date}", android.text.format.DateFormat.getMediumDateFormat(context).format(date))
       .replace("{day}", f("EEEE"))
@@ -344,38 +478,64 @@ object TextRenderer {
       .replace("{year}", f("yyyy"))
       .replace("{hour}", f(if (is24) "HH" else "h"))
       .replace("{minute}", f("mm"))
+      .replace("{quote}", quoteFor(nowMs))
+    if (out.contains("{battery}")) {
+      val level = runCatching {
+        context.getSystemService(android.os.BatteryManager::class.java)
+          ?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+      }.getOrNull()
+      out = out.replace("{battery}", if (level != null && level in 0..100) "$level%" else "")
+    }
+    out = COUNTDOWN.replace(out) { m ->
+      val (y, mo, d) = m.destructured
+      runCatching { countdown(nowMs, y.toInt(), mo.toInt(), d.toInt()) }.getOrDefault(m.value)
+    }
+    return out
   }
 
-  private fun layout(spec: TextSpec, screenH: Int, text: String): Pair<StaticLayout, Int> {
+  private fun layout(spec: TextSpec, screenH: Int, text: String, fontFile: File?): Triple<StaticLayout, Int, TextPaint> {
     val px = max(8f, spec.size * screenH)
     val paint = TextPaint(TextPaint.ANTI_ALIAS_FLAG).apply {
       color = spec.color
       textSize = px
-      typeface = typeface(spec.font, spec.bold)
+      typeface = typeface(spec.font, spec.bold, fontFile)
       if (spec.shadow) setShadowLayer(px * 0.08f, 0f, px * 0.03f, 0x99000000.toInt())
     }
     val shown = text.ifEmpty { " " }
-    val maxW = shown.split('\n').maxOf { ceil(paint.measureText(it)).toInt() } + 2
+    val outlinePx = spec.outline.coerceIn(0f, 0.4f) * px
+    val maxW = shown.split('\n').maxOf { ceil(paint.measureText(it)).toInt() } + 2 + ceil(outlinePx).toInt()
     val layout = StaticLayout.Builder.obtain(shown, 0, shown.length, paint, max(1, maxW))
       .setAlignment(Layout.Alignment.ALIGN_CENTER)
       .setIncludePad(true)
       .build()
-    return layout to (px * 0.2f).roundToInt()
+    return Triple(layout, (px * 0.2f + outlinePx).roundToInt(), paint)
   }
 
   /** Size in pixels of the rendered text bitmap. */
-  fun measure(context: Context, spec: TextSpec, screenH: Int, nowMs: Long = System.currentTimeMillis()): Pair<Int, Int> {
-    val (layout, pad) = layout(spec, screenH, format(context, spec.text, nowMs))
+  fun measure(context: Context, spec: TextSpec, screenH: Int, nowMs: Long = System.currentTimeMillis(), fontFile: File? = null): Pair<Int, Int> {
+    val (layout, pad) = layout(spec, screenH, format(context, spec.text, nowMs), fontFile)
     return min(4096, layout.width + pad * 2) to min(4096, layout.height + pad * 2)
   }
 
-  fun render(spec: TextSpec, screenH: Int, text: String): Bitmap {
-    val (layout, pad) = layout(spec, screenH, text)
+  fun render(spec: TextSpec, screenH: Int, text: String, fontFile: File? = null): Bitmap {
+    val (layout, pad, paint) = layout(spec, screenH, text, fontFile)
     val w = min(4096, layout.width + pad * 2)
     val h = min(4096, layout.height + pad * 2)
     val bmp = Bitmap.createBitmap(max(1, w), max(1, h), Bitmap.Config.ARGB_8888)
     val canvas = Canvas(bmp)
     canvas.translate(pad.toFloat(), pad.toFloat())
+    if (spec.outline > 0f) {
+      // Outline first (the layout keeps a reference to the paint, so switch its style around the draws).
+      val fillColor = paint.color
+      paint.style = android.graphics.Paint.Style.STROKE
+      paint.strokeJoin = android.graphics.Paint.Join.ROUND
+      paint.strokeWidth = spec.outline.coerceIn(0f, 0.4f) * paint.textSize
+      paint.color = spec.outlineColor
+      layout.draw(canvas)
+      paint.style = android.graphics.Paint.Style.FILL
+      paint.color = fillColor
+      paint.clearShadowLayer()
+    }
     layout.draw(canvas)
     return bmp
   }

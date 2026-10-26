@@ -35,10 +35,26 @@ data class Asset(
   val label: String = "",
   /** How the video was prepared, so it can be prepared again with other settings. */
   val prep: VideoPrep? = null,
+  /** For STICKER assets: how the frames are laid out in the sheet image. */
+  val sticker: StickerInfo? = null,
 )
 
+/** VIDEO = loop-ready MP4, IMAGE = photo/PNG, STICKER = transparent animation sheet (PNG), FONT = TTF/OTF for text. */
 @Serializable
-enum class AssetKind { VIDEO, IMAGE }
+enum class AssetKind { VIDEO, IMAGE, STICKER, FONT }
+
+/** An animated sticker stored as one PNG sheet: frames left to right, top to bottom, with [pad] px between cells. */
+@Serializable
+data class StickerInfo(
+  val cols: Int,
+  val rows: Int,
+  val frameW: Int,
+  val frameH: Int,
+  val delays: List<Int>,
+  val pad: Int = 2,
+) {
+  val totalMs: Int get() = delays.sum().coerceAtLeast(1)
+}
 
 @Serializable
 data class VideoPrep(
@@ -70,7 +86,14 @@ data class Scene(
   val isIntro: Boolean = false,
   /** How long an intro plays; 0 = one loop of its longest video (or 3 s). */
   val introDurationSec: Float = 0f,
+  /** Lock screen only, home screen only, or both. */
+  val showOn: ScreenFilter = ScreenFilter.ANY,
+  /** Only show when the battery is at or below this percentage (0 = no rule). */
+  val batteryBelow: Int = 0,
 )
+
+@Serializable
+enum class ScreenFilter { ANY, LOCK_SCREEN, HOME_SCREEN }
 
 /** Minutes after midnight; wraps past midnight when end < start (e.g. 18:00–06:00). */
 @Serializable
@@ -96,7 +119,14 @@ data class Layer(
   val gradient: GradientSpec? = null,
   val particles: ParticleSpec? = null,
   val text: TextSpec? = null,
+  /** Cuts the layer to a shape or fades its edges. */
+  val mask: MaskShape = MaskShape.NONE,
+  /** How soft the mask edge is, 0..1. */
+  val maskFeather: Float = 0.15f,
 )
+
+@Serializable
+enum class MaskShape { NONE, CIRCLE, ROUNDED, HEART, STAR, SOFT_EDGES, FADE_TOP, FADE_BOTTOM }
 
 @Serializable
 enum class Fit { COVER, CONTAIN, STRETCH, BLUR_FILL }
@@ -193,12 +223,16 @@ data class ParticleSpec(
   val wind: Float = 0f, // -1..1
   val color: Int = 0xFFFFFFFF.toInt(),
   val opacity: Float = 0.9f,
+  /** Tilting the phone pushes the particles the way gravity would. */
+  val followTilt: Boolean = false,
 )
 
 @Serializable
 enum class TextFont { SANS, SERIF, MONO, CONDENSED, LIGHT }
 
-/** Tokens: {time} {date} {day} {month} {year} {hour} {minute}. */
+/**
+ * Tokens: {time} {date} {day} {month} {year} {hour} {minute} {battery} {quote} {countdown:YYYY-MM-DD}.
+ */
 @Serializable
 data class TextSpec(
   val text: String = "{time}",
@@ -208,6 +242,11 @@ data class TextSpec(
   val font: TextFont = TextFont.LIGHT,
   val bold: Boolean = false,
   val shadow: Boolean = true,
+  /** Outline thickness as a fraction of the text size (0 = none). */
+  val outline: Float = 0f,
+  val outlineColor: Int = 0xFF000000.toInt(),
+  /** A FONT asset the user added; overrides [font]. */
+  val fontAsset: String? = null,
 )
 
 @Serializable
@@ -244,4 +283,19 @@ data class PlaybackSettings(
   val batterySaver: BatteryBehavior = BatteryBehavior.REDUCE,
   /** Zoom the wallpaper in a little while the notification shade is pulled down. */
   val zoomOnShade: Boolean = true,
+  /** 0 = off; otherwise how strongly colours follow the time of day (warm mornings, golden evenings, blue nights). */
+  val dayCycle: Float = 0f,
+  /** What happens when you tap an empty spot on the home screen. */
+  val touch: TouchEffect = TouchEffect(),
+)
+
+@Serializable
+enum class TouchKind { NONE, RIPPLE, SPARKLES, GLOW }
+
+@Serializable
+data class TouchEffect(
+  val kind: TouchKind = TouchKind.NONE,
+  val color: Int = 0xFFFFFFFF.toInt(),
+  /** 0.5..2 */
+  val size: Float = 1f,
 )
