@@ -6,7 +6,14 @@ import android.net.Uri
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import io.github.rdilipkumar.livewallpapermaker.data.CutoutUnavailable
+import io.github.rdilipkumar.livewallpapermaker.data.DepthPhotoMaker
+import io.github.rdilipkumar.livewallpapermaker.data.NoSubjectFound
 import io.github.rdilipkumar.livewallpapermaker.data.Ids
+import io.github.rdilipkumar.livewallpapermaker.data.Templates
+import io.github.rdilipkumar.livewallpapermaker.engine.model.Fit
+import io.github.rdilipkumar.livewallpapermaker.engine.model.TextSpec
+import io.github.rdilipkumar.livewallpapermaker.engine.model.Transform
 import io.github.rdilipkumar.livewallpapermaker.data.MediaImporter
 import io.github.rdilipkumar.livewallpapermaker.data.PickedMedia
 import io.github.rdilipkumar.livewallpapermaker.data.ProjectRepository
@@ -20,7 +27,12 @@ import io.github.rdilipkumar.livewallpapermaker.engine.model.PlaybackSettings
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Project
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Scene
 import io.github.rdilipkumar.livewallpapermaker.engine.model.SceneSwitching
+import io.github.rdilipkumar.livewallpapermaker.engine.creator.ExportOptions
+import io.github.rdilipkumar.livewallpapermaker.engine.creator.SceneExporter
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -40,7 +52,14 @@ sealed interface Screen {
 /** A picked video/GIF waiting for the user to choose trim and loop options. */
 data class PendingClip(val media: PickedMedia?, val targetLayerId: String?, val reprepare: Asset? = null)
 
+/** [label] is the full status line shown above the progress bar. */
 data class ImportJob(val label: String, val progress: Float)
+
+enum class PickKind { MEDIA, DEPTH_PHOTO }
+
+data class ShareRequest(val uri: Uri, val mime: String)
+
+data class PickRequest(val kind: PickKind, val targetLayerId: String?)
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
   val repo = ProjectRepository(app)
@@ -96,7 +115,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
   fun createFromTemplate(t: Template) {
     viewModelScope.launch(Dispatchers.IO) {
       val p = repo.create(t)
-      withContext(Dispatchers.Main) { open(p) }
+      withContext(Dispatchers.Main) {
+        open(p)
+        // The 3D photo template starts by asking for the photo.
+        if (t.id == Templates.DEPTH_PHOTO_ID) pickRequest.value = PickRequest(PickKind.DEPTH_PHOTO, null)
+      }
     }
   }
 
@@ -349,6 +372,73 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
   }
 
+  /** The editor watches this and opens the matching picker (used to start the 3D photo template). */
+  val pickRequest = MutableStateFlow<PickRequest?>(null)
+
+  private val depthMaker = DepthPhotoMaker(app, repo)
+
+  /** Makes a 3D photo from [uri] and adds its layers (background, optional clock, subject) to the current scene. */
+  fun makeDepthPhoto(uri: Uri, withClock: Boolean = true) {
+    runImport("3D photo") {
+      val label = runCatching {
+        getApplication<Application>().contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
+          ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+      }.getOrNull()?.takeIf { n -> !n.substringBeforeLast('.').all { it.isDigit() } } ?: "Photo"
+      val scene = currentScene ?: return@runImport
+      try {
+        val photo = depthMaker.make(uri, label) { status, p -> _importJob.value = ImportJob(status, p) }
+        val layers = DepthPhotoMaker.layers(photo, withClock)
+        edit(null) { it.copy(assets = it.assets + photo.background + photo.subject) }
+        updateScene(scene.id, null) { it.copy(layers = it.layers + layers) }
+        selectedLayerId.value = layers.last().id
+        say("3D photo ready. Tilt your phone or move the slider to see the depth.")
+      } catch (e: CancellationException) {
+        throw e
+      } catch (e: Exception) {
+        // Plan B that works everywhere: a floating photo card.
+        val reason = when (e) {
+          is CutoutUnavailable, is NoSubjectFound -> e.message
+          else -> "The cut-out tool isn't working on this phone"
+        }
+        _importJob.value = ImportJob("Making a 3D card", 0.8f)
+        val asset = importer.importImage(uri, label)
+        val layers = DepthPhotoMaker.cardLayers(asset, withClock)
+        edit(null) { it.copy(assets = it.assets + asset) }
+        updateScene(scene.id, null) { it.copy(layers = it.layers + layers) }
+        selectedLayerId.value = layers[1].id
+        say("$reason, so you got a floating 3D card instead. Tilt to see it.")
+      }
+    }
+  }
+
+  /** A transparent GIF kept as an animated sticker. */
+  fun startSticker(pending: PendingClip) {
+    val gif = pending.media as? PickedMedia.Gif ?: return
+    pendingClip.value = null
+    runImport(gif.label) {
+      val asset = importer.importSticker(gif)
+      attach(asset, pending.targetLayerId, fit = Fit.CONTAIN, scale = 0.5f)
+    }
+  }
+
+  /** For a motion photo: use the picture instead of its video. */
+  fun useStill(pending: PendingClip) {
+    val still = (pending.media as? PickedMedia.Video)?.stillUri ?: return
+    pendingClip.value = null
+    runImport("Photo") {
+      attach(importer.importImage(still, "Photo"), pending.targetLayerId)
+    }
+  }
+
+  fun importFont(uri: Uri, layerId: String) {
+    runImport("font") {
+      val asset = importer.importFont(uri)
+      edit(null) { it.copy(assets = it.assets + asset) }
+      updateLayer(layerId, null) { l -> l.copy(text = (l.text ?: TextSpec()).copy(fontAsset = asset.id)) }
+      say("Font \"${asset.label}\" added")
+    }
+  }
+
   fun requestReprepare(layer: Layer) {
     val asset = _project.value?.asset(layer.assetId) ?: return
     if (asset.prep?.sourceFile == null) {
@@ -362,10 +452,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     pendingClip.value = null
     val label = pending.media?.label ?: pending.reprepare?.label ?: "clip"
     runImport(label) {
+      val text = "Preparing $label"
       val asset = if (pending.reprepare != null) {
-        importer.reprepare(pending.reprepare, options) { p -> _importJob.value = ImportJob(label, p) }
+        importer.reprepare(pending.reprepare, options) { p -> _importJob.value = ImportJob(text, p) }
       } else {
-        importer.importClip(pending.media!!, options) { p -> _importJob.value = ImportJob(label, p) }
+        importer.importClip(pending.media!!, options) { p -> _importJob.value = ImportJob(text, p) }
       }
       attach(asset, pending.targetLayerId)
     }
@@ -373,7 +464,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
   private fun runImport(label: String, block: suspend () -> Unit) {
     importRunner?.cancel()
-    _importJob.value = ImportJob(label, 0f)
+    _importJob.value = ImportJob("Preparing $label", 0f)
     importRunner = viewModelScope.launch {
       try {
         block()
@@ -392,7 +483,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
   }
 
   /** Puts [asset] into the layer (or a new layer on top of the current scene). */
-  private fun attach(asset: Asset, targetLayerId: String?) {
+  private fun attach(asset: Asset, targetLayerId: String?, fit: Fit? = null, scale: Float? = null) {
     val p = _project.value ?: return
     val target = targetLayerId?.let { id -> p.scenes.flatMap { it.layers }.firstOrNull { it.id == id } }
     if (target != null) {
@@ -400,15 +491,85 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         q.copy(
           assets = q.assets + asset,
           scenes = q.scenes.map { s ->
-            s.copy(layers = s.layers.map { l -> if (l.id == target.id) l.copy(assetId = asset.id, type = LayerType.MEDIA) else l })
+            s.copy(layers = s.layers.map { l -> if (l.id == target.id) l.copy(assetId = asset.id, type = LayerType.MEDIA, fit = fit ?: l.fit) else l })
           },
         )
       }
       selectedLayerId.value = target.id
     } else {
-      val layer = Layer(id = Ids.new("l"), name = asset.label.substringBeforeLast('.').take(24).ifEmpty { "Media" }, assetId = asset.id)
+      val layer = Layer(
+        id = Ids.new("l"),
+        name = asset.label.substringBeforeLast('.').take(24).ifEmpty { "Media" },
+        assetId = asset.id,
+        fit = fit ?: Fit.COVER,
+        transform = Transform(scale = scale ?: 1f),
+      )
       edit(null) { it.copy(assets = it.assets + asset) }
       addLayer(layer)
+    }
+  }
+
+  // ---------------- Export ----------------
+
+  /** Set after an export; the editor opens the share sheet for it. */
+  val shareRequest = MutableStateFlow<ShareRequest?>(null)
+  private val exportDispatcher = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "lwm-export") }.asCoroutineDispatcher()
+
+  /** Renders [sceneId] to a video or GIF, saves it to the gallery and offers to share it. */
+  fun exportScene(sceneId: String, options: ExportOptions) {
+    val p = _project.value ?: return
+    importRunner?.cancel()
+    val what = if (options.gif) "GIF" else "video"
+    _importJob.value = ImportJob("Making the $what", 0f)
+    importRunner = viewModelScope.launch {
+      val app = getApplication<Application>()
+      val tmp = File(File(app.cacheDir, "exports").apply { mkdirs() }, "export-${System.nanoTime()}." + if (options.gif) "gif" else "mp4")
+      try {
+        val ctx = currentCoroutineContext()
+        withContext(exportDispatcher) {
+          SceneExporter.export(app, repo.storage, p, sceneId, options, tmp, isCancelled = { !ctx.isActive }) { f ->
+            _importJob.value = ImportJob("Making the $what", f)
+          }
+        }
+        val uri = withContext(Dispatchers.IO) { saveToGallery(tmp, options.gif, p.name) }
+        say(if (options.gif) "Saved to Pictures/Live Wallpaper Maker" else "Saved to Movies/Live Wallpaper Maker")
+        shareRequest.value = ShareRequest(uri, if (options.gif) "image/gif" else "video/mp4")
+      } catch (e: CancellationException) {
+        say("Cancelled")
+      } catch (e: Exception) {
+        say("Export failed: ${e.message}")
+      } finally {
+        tmp.delete()
+        _importJob.value = null
+      }
+    }
+  }
+
+  private fun saveToGallery(file: File, gif: Boolean, name: String): Uri {
+    val resolver = getApplication<Application>().contentResolver
+    val clean = name.replace(Regex("[^A-Za-z0-9 _-]"), "").replace(Regex("\\s+"), " ").trim().ifEmpty { "Wallpaper" }
+    val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(java.util.Date())
+    val values = android.content.ContentValues().apply {
+      put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, "$clean $stamp." + if (gif) "gif" else "mp4")
+      put(android.provider.MediaStore.MediaColumns.MIME_TYPE, if (gif) "image/gif" else "video/mp4")
+      put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, (if (gif) "Pictures" else "Movies") + "/Live Wallpaper Maker")
+      put(android.provider.MediaStore.MediaColumns.IS_PENDING, 1)
+    }
+    val collection = if (gif) {
+      android.provider.MediaStore.Images.Media.getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+    } else {
+      android.provider.MediaStore.Video.Media.getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+    }
+    val uri = resolver.insert(collection, values) ?: throw java.io.IOException("Couldn't save to the gallery")
+    try {
+      resolver.openOutputStream(uri)?.use { out -> file.inputStream().use { it.copyTo(out) } } ?: throw java.io.IOException("Couldn't write the file")
+      values.clear()
+      values.put(android.provider.MediaStore.MediaColumns.IS_PENDING, 0)
+      resolver.update(uri, values, null, null)
+      return uri
+    } catch (e: Exception) {
+      resolver.delete(uri, null, null)
+      throw e
     }
   }
 

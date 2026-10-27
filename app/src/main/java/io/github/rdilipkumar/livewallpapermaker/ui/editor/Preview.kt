@@ -47,7 +47,7 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /** Owns the editor's renderer (the same engine the wallpaper uses) and its TextureView. */
-class PreviewController(context: Context, storage: StorageLayout) {
+class PreviewController(context: Context, val storage: StorageLayout) {
   val renderer = WallpaperRenderer(context, storage)
   var textureView: TextureView? = null
 
@@ -81,9 +81,13 @@ fun rememberPreviewController(storage: StorageLayout): PreviewController {
 }
 
 /** Content size of a layer before fitting, in preview pixels. */
-fun contentSize(context: Context, layer: Layer, project: Project, w: Float, h: Float): Pair<Float, Float> = when (layer.type) {
+fun contentSize(context: Context, layer: Layer, project: Project, w: Float, h: Float, storage: StorageLayout? = null): Pair<Float, Float> = when (layer.type) {
   LayerType.MEDIA -> project.asset(layer.assetId)?.let { it.width.toFloat() to it.height.toFloat() } ?: (w to h)
-  LayerType.TEXT -> TextRenderer.measure(context, layer.text ?: TextSpec(), h.roundToInt()).let { it.first.toFloat() to it.second.toFloat() }
+  LayerType.TEXT -> {
+    val spec = layer.text ?: TextSpec()
+    val font = spec.fontAsset?.let { project.asset(it) }?.let { a -> storage?.assetFile(a) }
+    TextRenderer.measure(context, spec, h.roundToInt(), fontFile = font).let { it.first.toFloat() to it.second.toFloat() }
+  }
   else -> w to h
 }
 
@@ -101,6 +105,8 @@ fun PreviewSurface(
   onSelect: (String?) -> Unit,
   onTransform: (String, Transform) -> Unit,
   modifier: Modifier = Modifier,
+  playMode: Boolean = false,
+  onWallpaperTap: (Float, Float, Boolean) -> Unit = { _, _, _ -> },
 ) {
   val context = LocalContext.current
   var size by remember { mutableStateOf(IntSize.Zero) }
@@ -108,11 +114,12 @@ fun PreviewSurface(
   val latestProject by rememberUpdatedState(project)
   val latestSelected by rememberUpdatedState(selectedLayerId)
   val latestSwipe by rememberUpdatedState(swipe)
+  val latestPlay by rememberUpdatedState(playMode)
 
   fun poseOf(layer: Layer): Pose {
     val w = size.width.toFloat()
     val h = size.height.toFloat()
-    val (cw, ch) = contentSize(context, layer, latestProject, w, h)
+    val (cw, ch) = contentSize(context, layer, latestProject, w, h, controller.storage)
     return Geometry.pose(layer, cw, ch, w, h, MotionInput(swipe = latestSwipe))
   }
 
@@ -146,7 +153,18 @@ fun PreviewSurface(
       Modifier
         .fillMaxSize()
         .pointerInput(Unit) {
+          var lastTap = 0L
+          var lastPos = Offset.Zero
           detectTapGestures { pos ->
+            if (latestPlay) {
+              // Playing as the wallpaper: taps act like taps on the home screen.
+              val now = android.os.SystemClock.uptimeMillis()
+              val double = now - lastTap < 400 && (pos - lastPos).getDistance() < 150f
+              lastTap = if (double) 0L else now
+              lastPos = pos
+              onWallpaperTap(pos.x, pos.y, double)
+              return@detectTapGestures
+            }
             val s = latestScene ?: return@detectTapGestures
             val visible = s.layers.filter { it.visible }.asReversed()
             val hit = visible.firstOrNull { l ->
@@ -162,6 +180,7 @@ fun PreviewSurface(
           var raw = Transform()
           var lastAt = 0L
           detectTransformGestures { _, pan, zoom, rotation ->
+            if (latestPlay) return@detectTransformGestures
             val id = latestSelected ?: return@detectTransformGestures
             val layer = latestScene?.layers?.firstOrNull { it.id == id } ?: return@detectTransformGestures
             if (size.width == 0) return@detectTransformGestures
@@ -189,6 +208,8 @@ fun PreviewSurface(
         },
     ) {
       val s = latestScene ?: return@Canvas
+      // While playing as the wallpaper the preview may show another scene; no editing marks then.
+      if (latestPlay) return@Canvas
       // Empty media slots: a soft box with a plus, so it's clear something goes there.
       for (slot in s.layers) {
         if (!slot.visible || slot.type != LayerType.MEDIA || slot.assetId != null) continue

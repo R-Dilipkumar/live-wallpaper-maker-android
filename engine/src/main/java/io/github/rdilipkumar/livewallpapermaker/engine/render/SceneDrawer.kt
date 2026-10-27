@@ -28,22 +28,32 @@ internal class SourceStore(
   private val images = HashMap<String, ImageSource>() // by asset id
   private val videos = HashMap<String, VideoSource>() // by "sceneId/assetId"
   private val videoSpeed = HashMap<String, Float>()
+  private val stickers = HashMap<String, StickerSource>() // by "sceneId/assetId"
   private val texts = HashMap<String, TextSource>() // by "sceneId/layerId"
   var screenW = 1080
   var screenH = 1920
   private var videosStopped = false
+  private var project: Project? = null
 
   private fun videoKey(sceneId: String, assetId: String) = "$sceneId/$assetId"
+
+  /** File of a FONT asset, for text layers using a font the user added. */
+  private val fontFile: (String) -> java.io.File? = { id ->
+    project?.asset(id)?.takeIf { it.kind == AssetKind.FONT }?.let { storage.assetFile(it) }
+  }
 
   fun media(sceneId: String, asset: Asset): FrameSource? = when (asset.kind) {
     AssetKind.IMAGE -> images[asset.id]
     AssetKind.VIDEO -> videos[videoKey(sceneId, asset.id)]
+    AssetKind.STICKER -> stickers[videoKey(sceneId, asset.id)]
+    AssetKind.FONT -> null
   }
 
   fun text(sceneId: String, layer: Layer): TextSource? = texts["$sceneId/${layer.id}"]
 
   /** Makes sure every source the scene needs exists, and starts its videos. */
   fun prepare(scene: Scene, project: Project) {
+    this.project = project
     val maxImage = maxOf(2048, (maxOf(screenW, screenH) * 1.5f).toInt()).coerceAtMost(4096)
     for (layer in scene.layers) {
       if (!layer.visible) continue
@@ -60,12 +70,17 @@ internal class SourceStore(
               videoSpeed[key] = layer.playbackSpeed.coerceIn(0.1f, 4f)
               if (!videosStopped) v.start()
             }
+            AssetKind.STICKER -> {
+              val info = asset.sticker ?: continue
+              stickers.getOrPut(videoKey(scene.id, asset.id)) { StickerSource(file, info) }
+            }
+            AssetKind.FONT -> Unit
           }
         }
         LayerType.TEXT -> {
           val key = "${scene.id}/${layer.id}"
           val spec = layer.text ?: TextSpec()
-          val t = texts.getOrPut(key) { TextSource(context, spec, screenH) }
+          val t = texts.getOrPut(key) { TextSource(context, spec, screenH, fontFile) }
           t.update(spec, screenH)
           t.refresh(System.currentTimeMillis())
         }
@@ -91,6 +106,7 @@ internal class SourceStore(
     }
     images.keys.filter { it !in keepImages }.forEach { images.remove(it)?.release() }
     videos.keys.filter { it !in keepVideos }.forEach { videos.remove(it)?.release(); videoSpeed.remove(it) }
+    stickers.keys.filter { it !in keepVideos }.forEach { stickers.remove(it)?.release() }
     texts.keys.filter { it !in keepTexts }.forEach { texts.remove(it)?.release() }
   }
 
@@ -141,12 +157,18 @@ internal class SourceStore(
   fun releaseAll() {
     images.values.forEach { it.release() }
     videos.values.forEach { it.release() }
+    stickers.values.forEach { it.release() }
     texts.values.forEach { it.release() }
     images.clear()
     videos.clear()
+    stickers.clear()
     texts.clear()
     videoSpeed.clear()
   }
+
+  /** Every running video, for offline export (which drives decoding itself). */
+  internal fun allVideos(): Map<String, VideoSource> = videos
+  internal fun speedOf(key: String): Float = videoSpeed[key] ?: 1f
 }
 
 /** Draws one scene's layers, bottom to top, into the painter's current target. */
@@ -163,11 +185,13 @@ internal class SceneDrawer(private val painter: Painter, private val sources: So
         LayerType.MEDIA -> drawMedia(scene, layer, project, input, wf, hf)
         LayerType.GRADIENT -> {
           val pose = Geometry.pose(layer, wf, hf, wf, hf, input)
-          painter.drawGradient(layer.gradient ?: GradientSpec(), pose, input.timeSec, layer.blend)
+          painter.drawGradient(layer.gradient ?: GradientSpec(), pose, input.timeSec, layer.blend, layer.mask, layer.maskFeather)
         }
         LayerType.PARTICLES -> {
           val pose = Geometry.pose(layer, wf, hf, wf, hf, input)
-          painter.drawParticles(layer.particles ?: ParticleSpec(), pose, input.timeSec, layer.blend, h)
+          val spec = layer.particles ?: ParticleSpec()
+          val wind = if (spec.followTilt) (spec.wind + input.tiltX * 1.6f).coerceIn(-2f, 2f) else spec.wind
+          painter.drawParticles(spec, pose, input.timeSec, layer.blend, h, wind)
         }
         LayerType.TEXT -> {
           val src = sources.text(scene.id, layer) ?: continue
@@ -182,6 +206,7 @@ internal class SceneDrawer(private val painter: Painter, private val sources: So
   private fun drawMedia(scene: Scene, layer: Layer, project: Project, input: MotionInput, w: Float, h: Float) {
     val asset = project.asset(layer.assetId) ?: return
     val src = sources.media(scene.id, asset) ?: return
+    if (src is StickerSource) src.setTime((input.timeSec * 1000f * layer.playbackSpeed).toLong())
     if (!src.ready || src.texture == 0) return
     val cw = src.width.toFloat()
     val ch = src.height.toFloat()
@@ -198,9 +223,9 @@ internal class SceneDrawer(private val painter: Painter, private val sources: So
   private fun drawSource(key: String, src: FrameSource, layer: Layer, pose: io.github.rdilipkumar.livewallpapermaker.engine.model.Pose, timeSec: Float) {
     if (layer.effects.blur > 0.01f) {
       val tex = blurred(key, src, layer.effects.blur)
-      painter.drawTexture(tex, false, Gl.IDENTITY, pose, layer.effects, timeSec, layer.blend)
+      painter.drawTexture(tex, false, Gl.IDENTITY, pose, layer.effects, timeSec, layer.blend, mask = layer.mask, feather = layer.maskFeather)
     } else {
-      painter.drawTexture(src.texture, src.oes, src.texMatrix, pose, layer.effects, timeSec, layer.blend)
+      painter.drawTexture(src.texture, src.oes, src.texMatrix, pose, layer.effects, timeSec, layer.blend, mask = layer.mask, feather = layer.maskFeather)
     }
   }
 

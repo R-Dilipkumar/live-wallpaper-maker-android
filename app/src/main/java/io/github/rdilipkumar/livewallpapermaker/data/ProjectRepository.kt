@@ -105,7 +105,7 @@ class ProjectRepository(root: File) {
 
   /** Assets referenced by the project are copied with it; unused ones are dropped. */
   fun pruneUnusedAssets(project: Project): Project {
-    val used = project.scenes.flatMap { s -> s.layers.mapNotNull { it.assetId } }.toSet()
+    val used = project.scenes.flatMap { s -> s.layers.flatMap { listOfNotNull(it.assetId, it.text?.fontAsset) } }.toSet()
     return project.copy(assets = project.assets.filter { it.id in used })
   }
 

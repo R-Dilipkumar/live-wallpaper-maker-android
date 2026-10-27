@@ -22,8 +22,8 @@ android {
     // 29+: GL ES 3, ImageDecoder and the photo picker work with no storage permission.
     minSdk = 29
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0.0"
+    versionCode = 2
+    versionName = "1.1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -72,6 +72,8 @@ dependencies {
   implementation(libs.androidx.lifecycle.viewmodel.compose)
   implementation(libs.androidx.lifecycle.runtime.compose)
   implementation(libs.kotlinx.coroutines.android)
+  // On-phone subject cut-out for 3D photos (model comes from Google Play services, not the APK).
+  implementation(libs.mlkit.subject.segmentation)
 
   testImplementation(libs.junit)
 

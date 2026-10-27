@@ -8,7 +8,10 @@ import io.github.rdilipkumar.livewallpapermaker.engine.gl.Fbo
 import io.github.rdilipkumar.livewallpapermaker.engine.gl.Gl
 import io.github.rdilipkumar.livewallpapermaker.engine.gl.Quad
 import io.github.rdilipkumar.livewallpapermaker.engine.model.BlendMode
+import io.github.rdilipkumar.livewallpapermaker.engine.model.Easing
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Effects
+import io.github.rdilipkumar.livewallpapermaker.engine.model.Geometry
+import io.github.rdilipkumar.livewallpapermaker.engine.model.MaskShape
 import io.github.rdilipkumar.livewallpapermaker.engine.model.GradientSpec
 import io.github.rdilipkumar.livewallpapermaker.engine.model.ParticleSpec
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Pose
@@ -41,7 +44,14 @@ private class LayerProgram(oes: Boolean) {
   val tint = GLES30.glGetUniformLocation(id, "uTint")
   val fx = GLES30.glGetUniformLocation(id, "uFx")
   val wave = GLES30.glGetUniformLocation(id, "uWave")
+  val mask = GLES30.glGetUniformLocation(id, "uMask")
+  val feather = GLES30.glGetUniformLocation(id, "uFeather")
+  val day = GLES30.glGetUniformLocation(id, "uDay")
+  val dim = GLES30.glGetUniformLocation(id, "uDim")
 }
+
+/** A tap effect in progress: position in pixels, age 0..1 of its life. */
+internal class TouchFx(val x: Float, val y: Float, val age: Float, val ageSec: Float)
 
 /** Owns the shader programs and draws single layers, blurs and transitions. Render thread only. */
 internal class Painter {
@@ -52,6 +62,12 @@ internal class Painter {
   private val particles = Gl.program(Shaders.PARTICLE_VS, Shaders.PARTICLE_FS)
   private val blur = Gl.program(Shaders.QUAD_VS, Shaders.BLUR_FS)
   private val transition = Gl.program(Shaders.QUAD_VS, Shaders.TRANSITION_FS)
+  private val ripple = Gl.program(Shaders.QUAD_VS, Shaders.RIPPLE_FS)
+  private val burst = Gl.program(Shaders.BURST_VS, Shaders.BURST_FS)
+  private val glow = Gl.program(Shaders.QUAD_VS, Shaders.GLOW_FS)
+
+  /** Colour cast for the time of day (null = none). Applied once per layer, never to finished scenes. */
+  var dayTint: io.github.rdilipkumar.livewallpapermaker.engine.model.SceneLogic.DayTint? = null
 
   private val proj = FloatArray(16)
   private val model = FloatArray(16)
@@ -127,10 +143,16 @@ internal class Painter {
     blend: BlendMode = BlendMode.NORMAL,
     extraBrightness: Float = 0f,
     matrix: FloatArray? = null,
+    mask: MaskShape = MaskShape.NONE,
+    feather: Float = 0.15f,
+    applyDay: Boolean = true,
   ) {
     if (tex == 0 || pose.opacity <= 0.001f) return
     val p = if (oes) layerOes else layer2d
     GLES30.glUseProgram(p.id)
+    GLES30.glUniform1i(p.mask, mask.ordinal)
+    GLES30.glUniform1f(p.feather, feather)
+    setDay(p.day, p.dim, applyDay)
     GLES30.glUniformMatrix4fv(p.mvp, 1, false, matrix ?: poseMatrix(pose), 0)
     GLES30.glUniformMatrix4fv(p.texMatrix, 1, false, texMatrix, 0)
     bindTexture(0, tex, oes)
@@ -163,11 +185,25 @@ internal class Painter {
     quad.draw()
   }
 
-  fun drawGradient(spec: GradientSpec, pose: Pose, timeSec: Float, blend: BlendMode) {
+  private fun setDay(dayLoc: Int, dimLoc: Int, apply: Boolean) {
+    val d = dayTint
+    if (apply && d != null) {
+      GLES30.glUniform4f(dayLoc, d.r, d.g, d.b, d.amount)
+      GLES30.glUniform1f(dimLoc, d.dim)
+    } else {
+      GLES30.glUniform4f(dayLoc, 1f, 1f, 1f, 0f)
+      GLES30.glUniform1f(dimLoc, 0f)
+    }
+  }
+
+  fun drawGradient(spec: GradientSpec, pose: Pose, timeSec: Float, blend: BlendMode, mask: MaskShape = MaskShape.NONE, feather: Float = 0.15f) {
     if (pose.opacity <= 0.001f) return
     val colors = spec.colors.ifEmpty { listOf(Color.BLACK, Color.BLACK) }.take(4)
       .let { if (it.size == 1) it + it else it }
     GLES30.glUseProgram(gradient)
+    GLES30.glUniform1i(loc(gradient, "uMask"), mask.ordinal)
+    GLES30.glUniform1f(loc(gradient, "uFeather"), feather)
+    setDay(loc(gradient, "uDay"), loc(gradient, "uDim"), true)
     GLES30.glUniformMatrix4fv(loc(gradient, "uMvp"), 1, false, poseMatrix(pose), 0)
     for (i in 0 until 4) {
       val c = colors[minOf(i, colors.size - 1)]
@@ -189,14 +225,14 @@ internal class Painter {
     quad.draw()
   }
 
-  fun drawParticles(spec: ParticleSpec, pose: Pose, timeSec: Float, blend: BlendMode, screenH: Int) {
+  fun drawParticles(spec: ParticleSpec, pose: Pose, timeSec: Float, blend: BlendMode, screenH: Int, wind: Float = spec.wind) {
     if (pose.opacity <= 0.001f || spec.count <= 0) return
     GLES30.glUseProgram(particles)
     GLES30.glUniformMatrix4fv(loc(particles, "uMvp"), 1, false, poseMatrix(pose), 0)
     GLES30.glUniform1f(loc(particles, "uTime"), timeSec * spec.speed)
     GLES30.glUniform1i(loc(particles, "uKind"), spec.kind.ordinal)
     GLES30.glUniform1f(loc(particles, "uSizeScale"), spec.size * screenH / 2400f)
-    GLES30.glUniform1f(loc(particles, "uWind"), spec.wind)
+    GLES30.glUniform1f(loc(particles, "uWind"), wind)
     val c = spec.color
     GLES30.glUniform4f(loc(particles, "uColor"), Color.red(c) / 255f, Color.green(c) / 255f, Color.blue(c) / 255f, Color.alpha(c) / 255f)
     GLES30.glUniform1f(loc(particles, "uOpacity"), pose.opacity * spec.opacity)
@@ -220,6 +256,52 @@ internal class Painter {
     GLES30.glUniform4f(p.tint, 0f, 0f, 0f, 0f)
     GLES30.glUniform4f(p.fx, 0f, 0f, 0f, 0f)
     GLES30.glUniform2f(p.wave, 0f, 0f)
+    GLES30.glUniform1i(p.mask, 0)
+    setDay(p.day, p.dim, false)
+    quad.draw()
+  }
+
+  /** Copies the finished scene in [sceneTex] to the current target, bent by water ripples. */
+  fun drawRipples(sceneTex: Int, touches: List<TouchFx>, strength: Float) {
+    GLES30.glDisable(GLES30.GL_BLEND)
+    GLES30.glUseProgram(ripple)
+    GLES30.glUniformMatrix4fv(loc(ripple, "uMvp"), 1, false, fullTarget, 0)
+    bindTexture(0, sceneTex, false)
+    GLES30.glUniform1i(loc(ripple, "uScene"), 0)
+    val n = minOf(6, touches.size)
+    val data = FloatArray(24)
+    for (i in 0 until n) {
+      val t = touches[touches.size - n + i]
+      data[i * 4] = t.x / target.width
+      data[i * 4 + 1] = 1f - t.y / target.height
+      data[i * 4 + 2] = t.age
+      data[i * 4 + 3] = strength
+    }
+    GLES30.glUniform4fv(loc(ripple, "uRipples"), 6, data, 0)
+    GLES30.glUniform1i(loc(ripple, "uCount"), n)
+    GLES30.glUniform2f(loc(ripple, "uSize"), target.width.toFloat(), target.height.toFloat())
+    quad.draw()
+  }
+
+  fun drawSparkles(t: TouchFx, color: Int, size: Float) {
+    GLES30.glUseProgram(burst)
+    GLES30.glUniformMatrix4fv(loc(burst, "uMvp"), 1, false, proj, 0)
+    GLES30.glUniform2f(loc(burst, "uOrigin"), t.x, t.y)
+    GLES30.glUniform1f(loc(burst, "uAge"), t.ageSec)
+    GLES30.glUniform1f(loc(burst, "uScale"), pxScale * size)
+    GLES30.glUniform4f(loc(burst, "uColor"), Color.red(color) / 255f, Color.green(color) / 255f, Color.blue(color) / 255f, 1f)
+    setBlend(BlendMode.ADD)
+    quad.drawPoints(48)
+  }
+
+  fun drawGlow(t: TouchFx, color: Int, size: Float) {
+    val r = (0.10f + 0.32f * Geometry.ease(Easing.EASE_OUT, t.age)) * target.width * size
+    val pose = Pose(t.x, t.y, r * 2f, r * 2f, 0f, 1f)
+    GLES30.glUseProgram(glow)
+    GLES30.glUniformMatrix4fv(loc(glow, "uMvp"), 1, false, poseMatrix(pose), 0)
+    GLES30.glUniform4f(loc(glow, "uColor"), Color.red(color) / 255f, Color.green(color) / 255f, Color.blue(color) / 255f, 1f)
+    GLES30.glUniform1f(loc(glow, "uFade"), Math.pow((1.0 - t.age), 1.4).toFloat())
+    setBlend(BlendMode.ADD)
     quad.draw()
   }
 
@@ -295,7 +377,7 @@ internal class Painter {
     val m = FloatArray(16)
     Matrix.multiplyMM(m, 0, persp, 0, model, 0)
     val pose = Pose(0f, 0f, w, h, 0f, 1f)
-    drawTexture(tex, false, Gl.IDENTITY, pose, null, 0f, BlendMode.NORMAL, extraBrightness = -shade, matrix = m)
+    drawTexture(tex, false, Gl.IDENTITY, pose, null, 0f, BlendMode.NORMAL, extraBrightness = -shade, matrix = m, applyDay = false)
   }
 
   private val locations = HashMap<Long, Int>()
@@ -306,7 +388,7 @@ internal class Painter {
 
   fun release() {
     quad.release()
-    for (p in listOf(layer2d.id, layerOes.id, gradient, particles, blur, transition)) GLES30.glDeleteProgram(p)
+    for (p in listOf(layer2d.id, layerOes.id, gradient, particles, blur, transition, ripple, burst, glow)) GLES30.glDeleteProgram(p)
   }
 
   companion object {

@@ -11,12 +11,16 @@ import io.github.rdilipkumar.livewallpapermaker.engine.model.Motion
 import io.github.rdilipkumar.livewallpapermaker.engine.model.MotionPreset
 import io.github.rdilipkumar.livewallpapermaker.engine.model.ParticleKind
 import io.github.rdilipkumar.livewallpapermaker.engine.model.ParticleSpec
+import io.github.rdilipkumar.livewallpapermaker.engine.model.PlaybackSettings
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Project
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Scene
 import io.github.rdilipkumar.livewallpapermaker.engine.model.SceneSwitching
+import io.github.rdilipkumar.livewallpapermaker.engine.model.ScreenFilter
 import io.github.rdilipkumar.livewallpapermaker.engine.model.TextFont
 import io.github.rdilipkumar.livewallpapermaker.engine.model.TextSpec
 import io.github.rdilipkumar.livewallpapermaker.engine.model.TimeWindow
+import io.github.rdilipkumar.livewallpapermaker.engine.model.TouchEffect
+import io.github.rdilipkumar.livewallpapermaker.engine.model.TouchKind
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Transform
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Transition
 import io.github.rdilipkumar.livewallpapermaker.engine.model.TransitionType
@@ -37,10 +41,17 @@ data class Template(
 
 object Templates {
 
-  private fun project(name: String, scenes: List<Scene>, switching: SceneSwitching = SceneSwitching()): Project {
+  private fun project(
+    name: String,
+    scenes: List<Scene>,
+    switching: SceneSwitching = SceneSwitching(),
+    settings: PlaybackSettings = PlaybackSettings(),
+  ): Project {
     val now = System.currentTimeMillis()
-    return Project(id = Ids.new("p"), name = name, scenes = scenes, switching = switching, createdAt = now, updatedAt = now)
+    return Project(id = Ids.new("p"), name = name, scenes = scenes, switching = switching, settings = settings, createdAt = now, updatedAt = now)
   }
+
+  const val DEPTH_PHOTO_ID = "depth3d"
 
   private fun scene(name: String, vararg layers: Layer, transition: Transition = Transition(), bg: Int = 0xFF000000.toInt()) =
     Scene(id = Ids.new("s"), name = name, layers = layers.toList(), transitionIn = transition, background = bg)
@@ -54,11 +65,13 @@ object Templates {
       gradient = GradientSpec(colors.map { it.toInt() }, angle, radial, flow),
     )
 
-  fun particles(kind: ParticleKind, count: Int, color: Long = 0xFFFFFFFF, size: Float = 1f, speed: Float = 1f, wind: Float = 0f, blend: BlendMode = BlendMode.NORMAL, motion: Motion = Motion()) =
-    Layer(
-      id = Ids.new("l"), name = kind.name.lowercase().replaceFirstChar { it.uppercase() }, type = LayerType.PARTICLES,
-      particles = ParticleSpec(kind, count, size, speed, wind, color.toInt()), blend = blend, motion = motion,
-    )
+  fun particles(
+    kind: ParticleKind, count: Int, color: Long = 0xFFFFFFFF, size: Float = 1f, speed: Float = 1f, wind: Float = 0f,
+    blend: BlendMode = BlendMode.NORMAL, motion: Motion = Motion(), followTilt: Boolean = false,
+  ) = Layer(
+    id = Ids.new("l"), name = kind.name.lowercase().replaceFirstChar { it.uppercase() }, type = LayerType.PARTICLES,
+    particles = ParticleSpec(kind, count, size, speed, wind, color.toInt(), followTilt = followTilt), blend = blend, motion = motion,
+  )
 
   fun text(value: String, y: Float, size: Float = 0.08f, font: TextFont = TextFont.LIGHT, motion: Motion = Motion()) =
     Layer(
@@ -78,7 +91,7 @@ object Templates {
         particles(ParticleKind.STARS, 140, size = 0.8f, motion = Motion(swipeDepth = 0.06f, tiltDepth = 0.03f)),
         text("{time}", -0.28f, 0.11f, motion = Motion(tiltDepth = -0.015f)),
         text("{day}, {date}", -0.20f, 0.028f, TextFont.SANS, motion = Motion(tiltDepth = -0.015f)),
-        particles(ParticleKind.SNOW, 220, size = 1f, speed = 1f, wind = 0.2f, motion = Motion(swipeDepth = 0.12f, tiltDepth = 0.06f)),
+        particles(ParticleKind.SNOW, 220, size = 1f, speed = 1f, wind = 0.2f, motion = Motion(swipeDepth = 0.12f, tiltDepth = 0.06f), followTilt = true),
       ),
     ),
   )
@@ -87,7 +100,32 @@ object Templates {
     Template("blank", "Blank", "Start from an empty canvas.", 0) {
       project("My wallpaper", listOf(scene("Scene 1")))
     },
+    Template(DEPTH_PHOTO_ID, "3D photo", "Pick a photo: the person or pet is cut out and floats over the background, with the clock tucked behind them.", 0) {
+      project("3D photo", listOf(scene("3D photo")), settings = PlaybackSettings(touch = TouchEffect(TouchKind.GLOW)))
+    },
     Template("snow", "Snowy night", "Night sky, falling snow and a clock. No media needed.", 0) { snowyNight() },
+    Template("lockhome", "Lock & home", "A big clock on the lock screen, calm colours on the home screen. Colours follow the time of day.", 0) {
+      val lock = scene(
+        "Lock screen",
+        gradient(listOf(0xFF0F2027, 0xFF203A43, 0xFF2C5364), angle = 100f, flow = 1f),
+        particles(ParticleKind.STARS, 90, size = 0.7f, motion = Motion(tiltDepth = 0.03f)),
+        text("{time}", -0.22f, 0.16f, motion = Motion(tiltDepth = -0.02f)),
+        text("{day}, {date}", -0.11f, 0.03f, TextFont.SANS),
+        text("{quote}", 0.33f, 0.026f, TextFont.SERIF),
+        transition = Transition(TransitionType.FADE_COLOR, 600),
+      ).copy(showOn = ScreenFilter.LOCK_SCREEN)
+      val home = scene(
+        "Home screen",
+        gradient(listOf(0xFF1D2B64, 0xFF6D5BBA, 0xFFF8CDDA), angle = 80f, flow = 1.5f, motion = Motion(swipeDepth = 0.05f, tiltDepth = 0.03f)),
+        particles(ParticleKind.BOKEH, 22, size = 1.1f, speed = 0.5f, blend = BlendMode.SCREEN, motion = Motion(tiltDepth = 0.06f, swipeDepth = 0.08f)),
+        transition = Transition(TransitionType.ZOOM_IN, 900),
+      ).copy(showOn = ScreenFilter.HOME_SCREEN)
+      project(
+        "Lock & home",
+        listOf(lock, home),
+        settings = PlaybackSettings(dayCycle = 0.6f, touch = TouchEffect(TouchKind.RIPPLE)),
+      )
+    },
     Template("aurora", "Aurora", "Flowing colours with twinkling stars.", 0) {
       project(
         "Aurora",
@@ -109,9 +147,10 @@ object Templates {
             "Rain",
             gradient(listOf(0xFF1F2A36, 0xFF34495E, 0xFF5D6D7E), angle = 100f),
             particles(ParticleKind.BOKEH, 26, color = 0xFFFFC56E, size = 1.2f, speed = 0.6f, blend = BlendMode.SCREEN, motion = Motion(tiltDepth = 0.04f)),
-            particles(ParticleKind.RAIN, 260, color = 0xFFDDE7F0, speed = 1.1f, wind = -0.25f, motion = Motion(tiltDepth = 0.08f)),
+            particles(ParticleKind.RAIN, 260, color = 0xFFDDE7F0, speed = 1.1f, wind = -0.25f, motion = Motion(tiltDepth = 0.08f), followTilt = true),
           ),
         ),
+        settings = PlaybackSettings(touch = TouchEffect(TouchKind.RIPPLE)),
       )
     },
     Template("fireflies", "Fireflies", "Glowing fireflies drifting in the dark.", 0) {
@@ -125,6 +164,7 @@ object Templates {
             particles(ParticleKind.FIREFLIES, 70, color = 0xFFE9FF70, size = 1f, speed = 1f, blend = BlendMode.ADD, motion = Motion(tiltDepth = 0.09f, swipeDepth = 0.1f)),
           ),
         ),
+        settings = PlaybackSettings(touch = TouchEffect(TouchKind.SPARKLES, 0xFFE9FF70.toInt())),
       )
     },
     Template("video", "Single video", "One video or photo that fills the screen and slides as you swipe.", 1) {

@@ -29,6 +29,8 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Redo
 import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -74,8 +76,20 @@ import io.github.rdilipkumar.livewallpapermaker.engine.model.LayerType
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Project
 import io.github.rdilipkumar.livewallpapermaker.engine.model.SceneSwitching
 import io.github.rdilipkumar.livewallpapermaker.ui.MainViewModel
+import io.github.rdilipkumar.livewallpapermaker.ui.PickKind
 import io.github.rdilipkumar.livewallpapermaker.wallpaper.LiveWallpaperService
 import kotlinx.coroutines.launch
+
+/** Editor-only "what if" values for trying scene rules and day colours in the preview. */
+class PreviewSim {
+  var locked by mutableStateOf(false)
+
+  /** null = real time. */
+  var minute by mutableStateOf<Int?>(null)
+
+  /** null = real battery level. */
+  var battery by mutableStateOf<Int?>(null)
+}
 
 enum class EditorTab(val label: String) { LAYERS("Layers"), EDIT("Edit"), EFFECTS("Effects"), MOTION("Motion"), SCENES("Scenes"), WALLPAPER("Wallpaper") }
 
@@ -116,11 +130,17 @@ fun EditorScreen(vm: MainViewModel) {
   var swipe by remember { mutableFloatStateOf(0.5f) }
   var renaming by remember { mutableStateOf(false) }
   var pickTarget by remember { mutableStateOf<String?>(null) }
+  var fontTarget by remember { mutableStateOf<String?>(null) }
+  var exporting by remember { mutableStateOf(false) }
+  val sim = remember { PreviewSim() }
+  val pickRequest by vm.pickRequest.collectAsStateWithLifecycle()
 
   val scene = project.scenes.firstOrNull { it.id == sceneId } ?: project.scenes.firstOrNull()
   val layer = scene?.layers?.firstOrNull { it.id == layerId }
 
-  LaunchedEffect(Unit) { vm.messages.collect { snackbar.showSnackbar(it) } }
+  LaunchedEffect(Unit) {
+    vm.messages.collect { snackbar.showSnackbar(it, duration = if (it.length > 60) androidx.compose.material3.SnackbarDuration.Long else androidx.compose.material3.SnackbarDuration.Short) }
+  }
   LaunchedEffect(playAsWallpaper) { controller.renderer.setAutoScenes(playAsWallpaper) }
   val shown = remember(project, playAsWallpaper) { if (playAsWallpaper) project else project.forEditing() }
   // Leaving the editor saves the current preview as the project's thumbnail.
@@ -136,6 +156,10 @@ fun EditorScreen(vm: MainViewModel) {
   LaunchedEffect(swipe) { controller.renderer.setSwipe(swipe) }
   LaunchedEffect(tiltOn) { controller.renderer.setTiltAllowed(tiltOn) }
   LaunchedEffect(paused) { controller.renderer.setPaused(paused) }
+  // Pretend lock screen / time / battery, so scene rules and day colours can be tried in the preview.
+  LaunchedEffect(playAsWallpaper, sim.locked) { controller.renderer.setSimulatedLock(if (playAsWallpaper) sim.locked else null) }
+  LaunchedEffect(sim.minute) { controller.renderer.setTimeOverride(sim.minute) }
+  LaunchedEffect(sim.battery) { controller.renderer.setBatteryOverride(sim.battery) }
 
   val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
     if (uri != null) vm.onMediaPicked(uri, pickTarget)
@@ -143,6 +167,37 @@ fun EditorScreen(vm: MainViewModel) {
   val pick: (String?) -> Unit = { target ->
     pickTarget = target
     picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+  }
+  val depthPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+    if (uri != null) vm.makeDepthPhoto(uri)
+  }
+  val pickDepth: () -> Unit = { depthPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
+  val fontPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+    val target = fontTarget
+    if (uri != null && target != null) vm.importFont(uri, target)
+  }
+  val pickFont: (String) -> Unit = { layerIdForFont ->
+    fontTarget = layerIdForFont
+    fontPicker.launch(arrayOf("font/ttf", "font/otf", "font/sfnt", "application/x-font-ttf", "application/x-font-otf", "application/font-sfnt", "application/octet-stream"))
+  }
+  val share by vm.shareRequest.collectAsStateWithLifecycle()
+  LaunchedEffect(share) {
+    val r = share ?: return@LaunchedEffect
+    vm.shareRequest.value = null
+    val send = Intent(Intent.ACTION_SEND).apply {
+      type = r.mime
+      putExtra(Intent.EXTRA_STREAM, r.uri)
+      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    runCatching { context.startActivity(Intent.createChooser(send, "Share your wallpaper")) }
+  }
+  LaunchedEffect(pickRequest) {
+    val r = pickRequest ?: return@LaunchedEffect
+    vm.pickRequest.value = null
+    when (r.kind) {
+      PickKind.DEPTH_PHOTO -> pickDepth()
+      PickKind.MEDIA -> pick(r.targetLayerId)
+    }
   }
 
   Scaffold(
@@ -155,6 +210,7 @@ fun EditorScreen(vm: MainViewModel) {
         actions = {
           IconButton(onClick = { vm.undo() }, enabled = canUndo) { Icon(Icons.AutoMirrored.Filled.Undo, "Undo") }
           IconButton(onClick = { vm.redo() }, enabled = canRedo) { Icon(Icons.AutoMirrored.Filled.Redo, "Redo") }
+          IconButton(onClick = { exporting = true }, enabled = importJob == null) { Icon(Icons.Default.Share, "Export as video or GIF") }
           Button(
             onClick = {
               scope.launch {
@@ -178,7 +234,7 @@ fun EditorScreen(vm: MainViewModel) {
       importJob?.let { job ->
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
           Column(Modifier.weight(1f)) {
-            Text("Preparing ${job.label}… ${(job.progress * 100).toInt()}%", style = MaterialTheme.typography.bodySmall)
+            Text("${job.label}… ${(job.progress * 100).toInt()}%", style = MaterialTheme.typography.bodySmall)
             LinearProgressIndicator(progress = { job.progress }, modifier = Modifier.fillMaxWidth())
           }
           IconButton(onClick = { vm.cancelImport() }) { Icon(Icons.Default.Close, "Cancel") }
@@ -193,6 +249,11 @@ fun EditorScreen(vm: MainViewModel) {
           swipe = swipe,
           onSelect = { vm.selectedLayerId.value = it },
           onTransform = { id, t -> vm.updateLayer(id, "gesture") { it.copy(transform = t) } },
+          playMode = playAsWallpaper,
+          onWallpaperTap = { x, y, double ->
+            controller.renderer.touch(x, y)
+            if (double) controller.renderer.trigger(TriggerEvent.DOUBLE_TAP)
+          },
           modifier = Modifier.fillMaxHeight().aspectRatio(aspect).clip(RoundedCornerShape(14.dp)),
         )
       }
@@ -201,7 +262,14 @@ fun EditorScreen(vm: MainViewModel) {
         swipe = swipe, onSwipe = { swipe = it },
         tiltOn = tiltOn, onTilt = { tiltOn = it },
         playAsWallpaper = playAsWallpaper, onPlayAsWallpaper = { playAsWallpaper = it },
-        onTrigger = { controller.renderer.trigger(it) },
+        locked = sim.locked, onLocked = { lock ->
+          sim.locked = lock
+          if (lock) controller.renderer.trigger(TriggerEvent.SCREEN_ON)
+        },
+        onTrigger = { e ->
+          if (e == TriggerEvent.UNLOCK) sim.locked = false
+          controller.renderer.trigger(e)
+        },
       )
       ScrollableTabRow(selectedTabIndex = tab.ordinal, edgePadding = 8.dp) {
         EditorTab.entries.forEach { t -> Tab(selected = tab == t, onClick = { tab = t }, text = { Text(t.label) }) }
@@ -210,18 +278,19 @@ fun EditorScreen(vm: MainViewModel) {
         Modifier.fillMaxWidth().weight(0.48f).verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
       ) {
         when (tab) {
-          EditorTab.LAYERS -> LayersPanel(vm, project, scene, layerId, pick, onEdit = { tab = EditorTab.EDIT })
-          EditorTab.EDIT -> EditPanel(vm, project, layer, pick)
+          EditorTab.LAYERS -> LayersPanel(vm, project, scene, layerId, pick, pickDepth, onEdit = { tab = EditorTab.EDIT })
+          EditorTab.EDIT -> EditPanel(vm, project, layer, pick, pickFont)
           EditorTab.EFFECTS -> EffectsPanel(vm, layer)
           EditorTab.MOTION -> MotionPanel(vm, layer, controller)
-          EditorTab.SCENES -> ScenesPanel(vm, project, scene, controller)
-          EditorTab.WALLPAPER -> WallpaperPanel(vm, project)
+          EditorTab.SCENES -> ScenesPanel(vm, project, scene, controller, sim, playAsWallpaper)
+          EditorTab.WALLPAPER -> WallpaperPanel(vm, project, sim)
         }
       }
     }
   }
 
   pending?.let { ImportSheet(vm, it) }
+  if (exporting) ExportSheet(vm, project, scene, onDismiss = { exporting = false })
 
   if (renaming) {
     var name by remember { mutableStateOf(project.name) }
@@ -246,6 +315,7 @@ private fun PreviewControls(
   swipe: Float, onSwipe: (Float) -> Unit,
   tiltOn: Boolean, onTilt: (Boolean) -> Unit,
   playAsWallpaper: Boolean, onPlayAsWallpaper: (Boolean) -> Unit,
+  locked: Boolean, onLocked: (Boolean) -> Unit,
   onTrigger: (TriggerEvent) -> Unit,
 ) {
   Row(
@@ -264,7 +334,11 @@ private fun PreviewControls(
       Icon(Icons.Default.SlowMotionVideo, "Play as wallpaper (timers, intros, time of day)", modifier = Modifier.size(20.dp))
     }
     if (playAsWallpaper) {
-      IconButton(onClick = { onTrigger(TriggerEvent.UNLOCK) }) { Icon(Icons.Default.LockOpen, "Simulate unlock") }
+      if (locked) {
+        IconButton(onClick = { onTrigger(TriggerEvent.UNLOCK) }) { Icon(Icons.Default.LockOpen, "Simulate unlock") }
+      } else {
+        IconButton(onClick = { onLocked(true) }) { Icon(Icons.Default.Lock, "Show the lock screen") }
+      }
       IconButton(onClick = { onTrigger(TriggerEvent.DOUBLE_TAP) }) { Icon(Icons.Default.TouchApp, "Simulate double-tap") }
     }
   }
