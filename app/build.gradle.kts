@@ -72,6 +72,8 @@ dependencies {
   implementation(libs.androidx.lifecycle.viewmodel.compose)
   implementation(libs.androidx.lifecycle.runtime.compose)
   implementation(libs.kotlinx.coroutines.android)
+  // On-phone subject cut-out for 3D photos (model comes from Google Play services, not the APK).
+  implementation(libs.mlkit.subject.segmentation)
 
   testImplementation(libs.junit)
 

@@ -25,6 +25,7 @@ import androidx.compose.material.icons.filled.Gradient
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.ViewInAr
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Image as ImageIcon
 import androidx.compose.material.icons.filled.TextFields
@@ -61,6 +62,7 @@ import io.github.rdilipkumar.livewallpapermaker.engine.model.Fit
 import io.github.rdilipkumar.livewallpapermaker.engine.model.GradientSpec
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Layer
 import io.github.rdilipkumar.livewallpapermaker.engine.model.LayerType
+import io.github.rdilipkumar.livewallpapermaker.engine.model.MaskShape
 import io.github.rdilipkumar.livewallpapermaker.engine.model.ParticleKind
 import io.github.rdilipkumar.livewallpapermaker.engine.model.ParticleSpec
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Project
@@ -108,7 +110,15 @@ private fun LayerThumb(vm: MainViewModel, project: Project, layer: Layer) {
 }
 
 @Composable
-fun LayersPanel(vm: MainViewModel, project: Project, scene: Scene?, selectedId: String?, pick: (String?) -> Unit, onEdit: () -> Unit) {
+fun LayersPanel(
+  vm: MainViewModel,
+  project: Project,
+  scene: Scene?,
+  selectedId: String?,
+  pick: (String?) -> Unit,
+  pickDepth: () -> Unit,
+  onEdit: () -> Unit,
+) {
   if (scene == null) return
   var addMenu by remember { mutableStateOf(false) }
   var particleMenu by remember { mutableStateOf(false) }
@@ -122,6 +132,11 @@ fun LayersPanel(vm: MainViewModel, project: Project, scene: Scene?, selectedId: 
       }
       DropdownMenu(expanded = addMenu, onDismissRequest = { addMenu = false }) {
         DropdownMenuItem(text = { Text("Photo, GIF or video") }, leadingIcon = { Icon(Icons.Default.Movie, null) }, onClick = { addMenu = false; pick(null) })
+        DropdownMenuItem(
+          text = { Text("3D photo (cut out the subject)") },
+          leadingIcon = { Icon(Icons.Default.ViewInAr, null) },
+          onClick = { addMenu = false; pickDepth() },
+        )
         DropdownMenuItem(text = { Text("Empty media slot") }, leadingIcon = { Icon(Icons.Default.AddPhotoAlternate, null) }, onClick = {
           addMenu = false
           vm.addLayer(Templates.slot("Media slot"))
@@ -178,6 +193,7 @@ fun LayersPanel(vm: MainViewModel, project: Project, scene: Scene?, selectedId: 
           LayerType.MEDIA -> project.asset(layer.assetId)?.let { a ->
             when {
               a.kind == AssetKind.IMAGE -> if (a.hasAlpha) "Photo · transparent" else "Photo"
+              a.kind == AssetKind.STICKER -> "Sticker · ${a.sticker?.delays?.size ?: 1} frames"
               a.prep?.fromGif == true -> "GIF · %.1f s".format(a.durationMs / 1000f)
               else -> "Video · %.1f s".format(a.durationMs / 1000f)
             }
@@ -213,7 +229,7 @@ fun LayersPanel(vm: MainViewModel, project: Project, scene: Scene?, selectedId: 
 fun NoLayer() = Hint("Select a layer in the Layers tab, or tap it in the preview.")
 
 @Composable
-fun EditPanel(vm: MainViewModel, project: Project, layer: Layer?, pick: (String?) -> Unit) {
+fun EditPanel(vm: MainViewModel, project: Project, layer: Layer?, pick: (String?) -> Unit, pickFont: (String) -> Unit) {
   if (layer == null) return NoLayer()
   val id = layer.id
   var colorTarget by remember(id) { mutableStateOf<Pair<Int, (Int) -> Unit>?>(null) }
@@ -253,6 +269,7 @@ fun EditPanel(vm: MainViewModel, project: Project, layer: Layer?, pick: (String?
       LabeledSlider("Speed", p.speed, 0f..3f, { v -> vm.updateLayer(id, "pspeed") { it.copy(particles = p.copy(speed = v)) } })
       LabeledSlider("Wind", p.wind, -1f..1f, { v -> vm.updateLayer(id, "wind") { it.copy(particles = p.copy(wind = v)) } })
       LabeledSlider("Strength", p.opacity, 0f..1f, { v -> vm.updateLayer(id, "popac") { it.copy(particles = p.copy(opacity = v)) } }, format = ::percent)
+      SwitchRow("Fall with gravity", p.followTilt, { v -> vm.updateLayer(id, null) { it.copy(particles = p.copy(followTilt = v)) } }, "Tilt the phone and they drift that way")
       Row(verticalAlignment = Alignment.CenterVertically) {
         Text("Colour", Modifier.weight(1f))
         ColorSwatch(p.color, onClick = { colorTarget = p.color to { c -> vm.updateLayer(id, null) { it.copy(particles = p.copy(color = c)) } } })
@@ -269,18 +286,41 @@ fun EditPanel(vm: MainViewModel, project: Project, layer: Layer?, pick: (String?
       )
       Hint("Live tokens: tap to insert")
       FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        listOf("{time}", "{date}", "{day}", "{month}", "{year}", "{hour}", "{minute}").forEach { token ->
+        val nextYear = java.util.Calendar.getInstance().get(java.util.Calendar.YEAR) + 1
+        listOf(
+          "{time}", "{date}", "{day}", "{month}", "{year}", "{hour}", "{minute}", "{battery}", "{quote}",
+          "{countdown:$nextYear-01-01}",
+        ).forEach { token ->
           AssistChip(onClick = { vm.updateLayer(id, null) { it.copy(text = t.copy(text = t.text + token)) } }, label = { Text(token) })
         }
       }
+      Hint("{quote} shows a new short saying each day. {countdown:YYYY-MM-DD} counts the days to a date; change the date in the text.")
       LabeledSlider("Size", t.size, 0.015f..0.3f, { v -> vm.updateLayer(id, "tsize") { it.copy(text = t.copy(size = v)) } }, format = { "${(it * 1000).roundToInt() / 10f}%" })
-      ChipRow(TextFont.entries, t.font, { nice(it.name) }, { f -> vm.updateLayer(id, null) { it.copy(text = t.copy(font = f)) } })
+      val custom = t.fontAsset?.let { project.asset(it) }
+      ChipRow(TextFont.entries, if (custom == null) t.font else null, { nice(it.name) }, { f -> vm.updateLayer(id, null) { it.copy(text = t.copy(font = f, fontAsset = null)) } })
+      Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(if (custom != null) "Font: ${custom.label}" else "Your own font", Modifier.weight(1f))
+        OutlinedButton(onClick = { pickFont(id) }) { Text(if (custom != null) "Change" else "Font file…") }
+      }
       SwitchRow("Bold", t.bold, { v -> vm.updateLayer(id, null) { it.copy(text = t.copy(bold = v)) } })
       SwitchRow("Shadow", t.shadow, { v -> vm.updateLayer(id, null) { it.copy(text = t.copy(shadow = v)) } })
+      LabeledSlider("Outline", t.outline, 0f..0.3f, { v -> vm.updateLayer(id, "outline") { it.copy(text = t.copy(outline = v)) } }, format = { if (it == 0f) "Off" else percent(it / 0.3f) })
+      if (t.outline > 0f) Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("Outline colour", Modifier.weight(1f))
+        ColorSwatch(t.outlineColor, onClick = { colorTarget = t.outlineColor to { c -> vm.updateLayer(id, null) { it.copy(text = t.copy(outlineColor = c)) } } })
+      }
       Row(verticalAlignment = Alignment.CenterVertically) {
         Text("Colour", Modifier.weight(1f))
         ColorSwatch(t.color, onClick = { colorTarget = t.color to { c -> vm.updateLayer(id, null) { it.copy(text = t.copy(color = c)) } } })
       }
+    }
+  }
+
+  if (layer.type != LayerType.PARTICLES) {
+    SectionTitle("Shape")
+    ChipRow(MaskShape.entries, layer.mask, { if (it == MaskShape.NONE) "None" else nice(it.name) }, { m -> vm.updateLayer(id, null) { it.copy(mask = m) } })
+    if (layer.mask != MaskShape.NONE) {
+      LabeledSlider("Soft edge", layer.maskFeather, 0f..1f, { v -> vm.updateLayer(id, "feather") { it.copy(maskFeather = v) } }, format = ::percent)
     }
   }
 

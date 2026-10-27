@@ -121,13 +121,21 @@ fun ImportSheet(vm: MainViewModel, pending: PendingClip) {
   var window by remember { mutableIntStateOf(prep?.loopWindowMs ?: 600) }
   var quality by remember { mutableIntStateOf(1080) }
   var smooth by remember { mutableStateOf(prep?.smoothGif ?: false) }
+  val gif = media as? PickedMedia.Gif
+  var asSticker by remember { mutableStateOf(gif?.transparent == true) }
+  val motion = (media as? PickedMedia.Video)?.stillUri != null
 
   ModalBottomSheet(onDismissRequest = { vm.pendingClip.value = null }, sheetState = sheet) {
     Column(
       Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).navigationBarsPadding(),
     ) {
       Text(
-        if (pending.reprepare != null) "Trim & loop" else if (isGif) "Add GIF" else "Add video",
+        when {
+          pending.reprepare != null -> "Trim & loop"
+          motion -> "Add motion photo"
+          isGif -> "Add GIF"
+          else -> "Add video"
+        },
         style = MaterialTheme.typography.titleLarge,
       )
       Text(media?.label ?: pending.reprepare?.label ?: "", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -170,7 +178,17 @@ fun ImportSheet(vm: MainViewModel, pending: PendingClip) {
         Hint("${media.width}×${media.height} · ${media.frames} frames · ${secs(media.durationMs)}")
       }
 
-      if (durationMs > 0) {
+      if (motion) {
+        Hint("This photo has a short video inside. It becomes a looping live layer.")
+        OutlinedButton(onClick = { vm.useStill(pending) }, modifier = Modifier.fillMaxWidth()) { Text("Use the still photo instead") }
+      }
+      if (gif != null && gif.transparent) {
+        SwitchRow(
+          "Keep transparency (animated sticker)", asSticker, { asSticker = it },
+          "Floats over other layers. Turn off to make it a full-screen clip with a black background.",
+        )
+      }
+      if (durationMs > 0 && !asSticker) {
         SectionTitle("Trim")
         val maxLen = if (loop == LoopStyle.PING_PONG) LoopBaker.PING_PONG_MAX_MS else MediaImporter.MAX_CLIP_MS
         RangeSlider(
@@ -191,6 +209,7 @@ fun ImportSheet(vm: MainViewModel, pending: PendingClip) {
         Hint("Shorter clips use less storage. Up to ${maxLen / 1000} s.")
       }
 
+      if (!asSticker) {
       SectionTitle("Loop")
       ChipRow(LoopStyle.entries, loop, ::loopLabel, { loop = it })
       Hint(loopHint(loop))
@@ -202,11 +221,16 @@ fun ImportSheet(vm: MainViewModel, pending: PendingClip) {
       }
       SectionTitle("Quality")
       ChipRow(listOf(720, 1080), quality, { if (it == 720) "720p · smaller" else "1080p · sharper" }, { quality = it })
+      }
 
       Row(Modifier.fillMaxWidth().padding(vertical = 16.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         OutlinedButton(onClick = { vm.pendingClip.value = null }, modifier = Modifier.weight(1f)) { Text("Cancel") }
         Button(
           onClick = {
+            if (asSticker) {
+              vm.startSticker(pending)
+              return@Button
+            }
             vm.startClip(
               pending,
               BakeOptions(

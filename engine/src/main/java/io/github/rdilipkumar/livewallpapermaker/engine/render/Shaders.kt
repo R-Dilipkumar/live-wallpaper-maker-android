@@ -241,8 +241,8 @@ void main() {
     float fade = (1.0 - r.z) * (1.0 - r.z) * r.w;
     float wave = sin(x * 70.0) * exp(-x * x * 160.0) * fade;
     vec2 dir = dist > 0.0001 ? d / dist : vec2(0.0);
-    offset += dir / asp * wave * 0.018;
-    light += wave * 0.12;
+    offset += dir / asp * wave * 0.024;
+    light += wave * 0.16;
   }
   vec4 c = texture(uScene, vUv + offset);
   fragColor = vec4(c.rgb + light, 1.0);

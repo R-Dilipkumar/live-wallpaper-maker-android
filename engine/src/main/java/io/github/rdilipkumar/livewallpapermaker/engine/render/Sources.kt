@@ -102,7 +102,7 @@ internal class VideoSource(
   var failed = false; private set
   val running: Boolean get() = codec != null
 
-  private var pendingLatch = false
+  @Volatile private var pendingLatch = false
   private val surfaceTexture = SurfaceTexture(texture).apply {
     setOnFrameAvailableListener({
       pendingLatch = true
@@ -239,6 +239,27 @@ internal class VideoSource(
       c.queueInputBuffer(inIdx, 0, size, pts - firstPts + loopOffset, 0)
       ex.advance()
     }
+  }
+
+  /**
+   * Offline use (export): decodes until the picture for [localUs] is in the texture. The frame-available
+   * callback must arrive on another thread. Returns false if the decoder fails or takes too long.
+   */
+  fun advanceTo(localUs: Long, timeoutMs: Long = 3000): Boolean {
+    val deadline = System.currentTimeMillis() + timeoutMs
+    while (System.currentTimeMillis() < deadline) {
+      if (failed || codec == null) return false
+      val released = tick(localUs)
+      if (released) {
+        val wait = System.currentTimeMillis() + 300
+        while (!pendingLatch && System.currentTimeMillis() < wait) Thread.sleep(1)
+        latch()
+      }
+      // Caught up once the next decoded frame belongs to the future.
+      if (heldIndex >= 0 && heldPts > localUs - skew) return true
+      if (!released) Thread.sleep(1)
+    }
+    return frameCounter > 0
   }
 
   /** Moves the newest decoded picture into the texture. */

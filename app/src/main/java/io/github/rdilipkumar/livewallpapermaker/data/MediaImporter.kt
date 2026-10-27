@@ -9,7 +9,9 @@ import android.provider.OpenableColumns
 import io.github.rdilipkumar.livewallpapermaker.engine.creator.BakeOptions
 import io.github.rdilipkumar.livewallpapermaker.engine.creator.GifStreamDecoder
 import io.github.rdilipkumar.livewallpapermaker.engine.creator.LoopBaker
+import io.github.rdilipkumar.livewallpapermaker.engine.creator.MotionPhoto
 import io.github.rdilipkumar.livewallpapermaker.engine.creator.Remuxer
+import io.github.rdilipkumar.livewallpapermaker.engine.creator.StickerSheet
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Asset
 import io.github.rdilipkumar.livewallpapermaker.engine.model.AssetKind
 import io.github.rdilipkumar.livewallpapermaker.engine.model.VideoPrep
@@ -32,8 +34,26 @@ sealed interface PickedMedia {
   val label: String
 
   data class Image(override val uri: Uri, override val label: String) : PickedMedia
-  data class Video(override val uri: Uri, override val label: String, val durationMs: Long, val width: Int, val height: Int) : PickedMedia
-  data class Gif(override val uri: Uri, override val label: String, val durationMs: Long, val frames: Int, val width: Int, val height: Int) : PickedMedia
+
+  /** [stillUri] is set for motion photos: the video was pulled out of a photo, which can still be used as-is. */
+  data class Video(
+    override val uri: Uri,
+    override val label: String,
+    val durationMs: Long,
+    val width: Int,
+    val height: Int,
+    val stillUri: Uri? = null,
+  ) : PickedMedia
+
+  data class Gif(
+    override val uri: Uri,
+    override val label: String,
+    val durationMs: Long,
+    val frames: Int,
+    val width: Int,
+    val height: Int,
+    val transparent: Boolean = false,
+  ) : PickedMedia
 }
 
 /** Turns picked photos, GIFs and videos into assets in the shared asset folder. */
@@ -56,15 +76,74 @@ class MediaImporter(private val context: Context, private val repo: ProjectRepos
         }
         val delays = decoder.scanDelays()
         if (delays.size <= 1) PickedMedia.Image(uri, label)
-        else PickedMedia.Gif(uri, label, delays.sum().toLong(), delays.size, decoder.width, decoder.height)
+        else PickedMedia.Gif(
+          uri, label, delays.sum().toLong(), delays.size, decoder.width, decoder.height,
+          transparent = runCatching { StickerSheet.hasTransparency(bytes) }.getOrDefault(false),
+        )
       }
       mime.startsWith("video/") -> {
         val info = Remuxer.probe(context, uri)
         if (info.durationMs <= 0) throw IOException("This video has no length")
         PickedMedia.Video(uri, label, info.durationMs, info.width, info.height)
       }
-      else -> PickedMedia.Image(uri, label)
+      else -> motionPhoto(uri, label) ?: PickedMedia.Image(uri, label)
     }
+  }
+
+  /** Pixel and Samsung "motion photos" hide a short video after the picture. Returns it if there is one. */
+  private fun motionPhoto(uri: Uri, label: String): PickedMedia.Video? {
+    val bytes = runCatching { readLimited(uri, MAX_MOTION_PHOTO_BYTES) }.getOrNull() ?: return null
+    val offset = MotionPhoto.findVideoOffset(bytes)
+    if (offset < 0) return null
+    val dir = File(context.cacheDir, "motion").apply { mkdirs() }
+    dir.listFiles()?.forEach { it.delete() }
+    val file = File(dir, "motion-${System.nanoTime()}.mp4")
+    file.outputStream().use { it.write(bytes, offset, bytes.size - offset) }
+    return runCatching {
+      val info = Remuxer.probe(context, Uri.fromFile(file))
+      if (info.durationMs <= 0) null
+      else PickedMedia.Video(Uri.fromFile(file), "Motion photo", info.durationMs, info.width, info.height, stillUri = uri)
+    }.getOrNull().also { if (it == null) file.delete() }
+  }
+
+  /** Keeps a transparent GIF transparent: all frames go into one sheet image the wallpaper animates. */
+  suspend fun importSticker(media: PickedMedia.Gif): Asset = withContext(Dispatchers.Default) {
+    val bytes = readLimited(media.uri, MAX_GIF_BYTES)
+    val sheet = try {
+      StickerSheet.build(bytes)
+    } catch (e: Exception) {
+      throw IOException("This GIF could not be read", e)
+    }
+    val id = Ids.new("a")
+    val bmp = Bitmap.createBitmap(sheet.width, sheet.height, Bitmap.Config.ARGB_8888)
+    bmp.setPixels(sheet.pixels, 0, sheet.width, 0, 0, sheet.width, sheet.height)
+    storage.assetsDir.mkdirs()
+    File(storage.assetsDir, "$id.png").outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+    val info = sheet.info
+    val first = Bitmap.createBitmap(bmp, info.pad, info.pad, info.frameW, info.frameH)
+    writeThumb(id, first)
+    if (first !== bmp) first.recycle()
+    bmp.recycle()
+    Asset(
+      id, AssetKind.STICKER, "$id.png", info.frameW, info.frameH, info.totalMs.toLong(),
+      hasAlpha = true, label = media.label, sticker = info,
+    )
+  }
+
+  /** A TTF/OTF font for text layers. */
+  suspend fun importFont(uri: Uri): Asset = withContext(Dispatchers.IO) {
+    val label = displayName(uri)
+    val ext = if (label.endsWith(".otf", true)) "otf" else "ttf"
+    val id = Ids.new("a")
+    storage.assetsDir.mkdirs()
+    val file = File(storage.assetsDir, "$id.$ext")
+    file.writeBytes(readLimited(uri, 30_000_000L))
+    val ok = runCatching { android.graphics.Typeface.createFromFile(file) }.isSuccess
+    if (!ok) {
+      file.delete()
+      throw IOException("This isn't a font file Android can use (try a .ttf or .otf)")
+    }
+    Asset(id, AssetKind.FONT, file.name, 0, 0, label = label.substringBeforeLast('.').ifEmpty { "Font" })
   }
 
   suspend fun importImage(uri: Uri, label: String): Asset = withContext(Dispatchers.IO) {
@@ -233,6 +312,7 @@ class MediaImporter(private val context: Context, private val repo: ProjectRepos
   companion object {
     const val MAX_IMAGE_SIDE = 2560
     const val MAX_GIF_BYTES = 60_000_000L
+    const val MAX_MOTION_PHOTO_BYTES = 80_000_000L
     const val MAX_CLIP_MS = 60_000L
   }
 }

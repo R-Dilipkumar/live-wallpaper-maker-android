@@ -44,6 +44,8 @@ import io.github.rdilipkumar.livewallpapermaker.engine.model.LoopMode
 import io.github.rdilipkumar.livewallpapermaker.engine.model.MotionPreset
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Project
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Scene
+import io.github.rdilipkumar.livewallpapermaker.engine.model.ScreenFilter
+import io.github.rdilipkumar.livewallpapermaker.engine.model.TouchKind
 import io.github.rdilipkumar.livewallpapermaker.engine.model.TimeWindow
 import io.github.rdilipkumar.livewallpapermaker.engine.model.TransitionType
 import io.github.rdilipkumar.livewallpapermaker.ui.ChipRow
@@ -165,7 +167,7 @@ private fun timerLabel(s: Int) = when {
 private fun hourLabel(minute: Int): String = "%02d:%02d".format(minute / 60 % 24, minute % 60)
 
 @Composable
-fun ScenesPanel(vm: MainViewModel, project: Project, scene: Scene?, controller: PreviewController) {
+fun ScenesPanel(vm: MainViewModel, project: Project, scene: Scene?, controller: PreviewController, sim: PreviewSim, playing: Boolean) {
   if (scene == null) return
   val scope = rememberCoroutineScope()
   var colorPicker by remember { mutableStateOf<String?>(null) }
@@ -224,11 +226,23 @@ fun ScenesPanel(vm: MainViewModel, project: Project, scene: Scene?, controller: 
     LabeledSlider("Until", window.endMinute.toFloat(), 0f..1410f, { v -> vm.updateScene(scene.id, "tw2") { it.copy(timeWindow = window.copy(endMinute = (v / 30).roundToInt() * 30)) } }, format = { hourLabel(it.roundToInt()) })
   }
   SwitchRow("Only while charging", scene.onlyWhileCharging, { v -> vm.updateScene(scene.id, null) { it.copy(onlyWhileCharging = v) } })
+  Text("Show on", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 4.dp))
+  ChipRow(ScreenFilter.entries, scene.showOn, {
+    when (it) {
+      ScreenFilter.ANY -> "Both screens"
+      ScreenFilter.LOCK_SCREEN -> "Lock screen"
+      ScreenFilter.HOME_SCREEN -> "Home screen"
+    }
+  }, { f -> vm.updateScene(scene.id, null) { it.copy(showOn = f) } })
+  LabeledSlider("Only when battery is below", scene.batteryBelow.toFloat(), 0f..60f, { v ->
+    vm.updateScene(scene.id, "battery") { it.copy(batteryBelow = ((v / 5).roundToInt() * 5)) }
+  }, format = { if (it < 1f) "Off" else "${it.roundToInt()}%" })
   SwitchRow("Unlock intro", scene.isIntro, { v -> vm.updateScene(scene.id, null) { it.copy(isIntro = v) } }, "Plays once each time you unlock, then the normal scene returns")
   if (scene.isIntro) {
     LabeledSlider("Intro length", scene.introDurationSec, 0f..30f, { v -> vm.updateScene(scene.id, "intro") { it.copy(introDurationSec = (v * 2).roundToInt() / 2f) } }, format = { if (it == 0f) "One loop" else "%.1f s".format(it) })
   }
-  Hint("Turn on ▶ under the preview to try timers, intros and hours here.")
+  Hint("Turn on ▶ under the preview to try timers, intros, the lock screen and these rules.")
+  TryInPreview(sim, playing)
 
   SectionTitle("Switching scenes")
   val sw = project.switching
@@ -247,8 +261,36 @@ fun ScenesPanel(vm: MainViewModel, project: Project, scene: Scene?, controller: 
 }
 
 @Composable
-fun WallpaperPanel(vm: MainViewModel, project: Project) {
+fun WallpaperPanel(vm: MainViewModel, project: Project, sim: PreviewSim) {
   val s = project.settings
+  var tapColour by remember { mutableStateOf(false) }
+  SectionTitle("When you tap the home screen")
+  ChipRow(TouchKind.entries, s.touch.kind, {
+    when (it) {
+      TouchKind.NONE -> "Nothing"
+      TouchKind.RIPPLE -> "Water ripple"
+      TouchKind.SPARKLES -> "Sparkles"
+      TouchKind.GLOW -> "Glow"
+    }
+  }, { k -> vm.updateSettings("touch") { it.copy(touch = it.touch.copy(kind = k)) } })
+  if (s.touch.kind != TouchKind.NONE) {
+    LabeledSlider("Size", s.touch.size, 0.5f..2f, { v -> vm.updateSettings("touchsize") { it.copy(touch = it.touch.copy(size = v)) } }, format = { "%.1fx".format(it) })
+    if (s.touch.kind != TouchKind.RIPPLE) Row(verticalAlignment = Alignment.CenterVertically) {
+      Text("Colour", Modifier.weight(1f))
+      ColorSwatch(s.touch.color, onClick = { tapColour = true })
+    }
+    Hint("Turn on ▶ under the preview and tap it to try. On the phone, tap an empty spot of the home screen.")
+  }
+  SectionTitle("Colours that follow the day")
+  LabeledSlider("Strength", s.dayCycle, 0f..1f, { v -> vm.updateSettings("day") { it.copy(dayCycle = v) } }, format = { if (it == 0f) "Off" else percent(it) })
+  Hint("Warm mornings, golden evenings, cool blue nights.")
+  if (s.dayCycle > 0f) TimeSlider(sim)
+  if (tapColour) {
+    ColorPickerDialog(s.touch.color, onDismiss = { tapColour = false }, onPick = { c ->
+      vm.updateSettings("touchcolour") { it.copy(touch = it.touch.copy(color = c)) }
+      tapColour = false
+    })
+  }
   SectionTitle("Smoothness")
   ChipRow(listOf(15, 24, 30, 60), s.fpsCap, { "$it fps" }, { f -> vm.updateSettings("fps") { it.copy(fpsCap = f) } })
   Hint("30 fps looks smooth and saves battery. Videos never play faster than they were made.")
@@ -270,6 +312,40 @@ fun WallpaperPanel(vm: MainViewModel, project: Project) {
   Card(shape = RoundedCornerShape(12.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
     Column(Modifier.padding(12.dp)) {
       Text("${project.scenes.size} scenes · ${project.scenes.sumOf { it.layers.size }} layers · ${project.assets.size} media files", style = MaterialTheme.typography.bodySmall)
+    }
+  }
+}
+
+
+/** Lets the time of day be faked in the preview (for day colours and time rules). */
+@Composable
+fun TimeSlider(sim: PreviewSim) {
+  val minute = sim.minute
+  LabeledSlider(
+    if (minute == null) "Preview time: now" else "Preview time",
+    (minute ?: java.util.Calendar.getInstance().let { it.get(java.util.Calendar.HOUR_OF_DAY) * 60 + it.get(java.util.Calendar.MINUTE) }).toFloat(),
+    0f..1439f,
+    { v -> sim.minute = ((v / 15).roundToInt() * 15).coerceAtMost(1439) },
+    format = { hourLabel(it.roundToInt()) },
+  )
+  if (minute != null) TextButton(onClick = { sim.minute = null }) { Text("Back to the real time") }
+}
+
+@Composable
+private fun TryInPreview(sim: PreviewSim, playing: Boolean) {
+  Card(Modifier.fillMaxWidth().padding(vertical = 6.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
+    Column(Modifier.padding(12.dp)) {
+      Text("Try it in the preview", style = MaterialTheme.typography.titleSmall)
+      if (!playing) Hint("These only matter while ▶ (play as wallpaper) is on.")
+      TimeSlider(sim)
+      val battery = sim.battery
+      LabeledSlider(
+        if (battery == null) "Battery: real" else "Battery",
+        (battery ?: 100).toFloat(), 1f..100f,
+        { v -> sim.battery = v.roundToInt() },
+        format = { "${it.roundToInt()}%" },
+      )
+      if (battery != null) TextButton(onClick = { sim.battery = null }) { Text("Back to the real battery") }
     }
   }
 }
