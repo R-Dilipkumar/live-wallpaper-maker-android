@@ -208,6 +208,8 @@ fun PreviewSurface(
         },
     ) {
       val s = latestScene ?: return@Canvas
+      // While playing as the wallpaper the preview may show another scene; no editing marks then.
+      if (latestPlay) return@Canvas
       // Empty media slots: a soft box with a plus, so it's clear something goes there.
       for (slot in s.layers) {
         if (!slot.visible || slot.type != LayerType.MEDIA || slot.assetId != null) continue

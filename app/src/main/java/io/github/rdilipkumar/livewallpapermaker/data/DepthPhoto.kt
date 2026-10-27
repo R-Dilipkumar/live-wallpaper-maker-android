@@ -36,6 +36,12 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
+/** The cut-out tool can't run here (no Google Play services, or its model couldn't be downloaded). */
+class CutoutUnavailable(message: String, cause: Throwable? = null) : IOException(message, cause)
+
+/** The photo has no clear subject to cut out. */
+class NoSubjectFound(message: String) : IOException(message)
+
 /** The two pictures a 3D photo is made of: the filled-in background and the cut-out subject (same size). */
 data class DepthPhoto(val background: Asset, val subject: Asset)
 
@@ -56,13 +62,13 @@ class DepthPhotoMaker(private val context: Context, private val repo: ProjectRep
       val w = photo.width
       val h = photo.height
       val result = segmenter.process(InputImage.fromBitmap(photo, 0)).await()
-      val maskBuffer = result.foregroundConfidenceMask ?: throw IOException("No subject was found in this photo")
+      val maskBuffer = result.foregroundConfidenceMask ?: throw NoSubjectFound("No subject was found in this photo")
       val conf = FloatArray(w * h)
       maskBuffer.rewind()
       maskBuffer.get(conf, 0, min(conf.size, maskBuffer.remaining()))
       val covered = conf.count { it > 0.5f }.toFloat() / conf.size
-      if (covered < 0.01f) throw IOException("No clear subject was found in this photo. Try one with a person, pet or object in front.")
-      if (covered > 0.95f) throw IOException("The subject fills the whole photo. Try one with some background around it.")
+      if (covered < 0.01f) throw NoSubjectFound("No clear subject was found in this photo")
+      if (covered > 0.95f) throw NoSubjectFound("The subject fills the whole photo")
 
       onStatus("Cutting out", 0.6f)
       val assets = withContext(Dispatchers.Default) { build(photo, conf, label) }
@@ -76,10 +82,22 @@ class DepthPhotoMaker(private val context: Context, private val repo: ProjectRep
   private suspend fun ensureModule(segmenter: com.google.android.gms.common.api.OptionalModuleApi, onStatus: (String, Float) -> Unit) {
     val client = ModuleInstall.getClient(context)
     val available = runCatching { client.areModulesAvailable(segmenter).await().areModulesAvailable() }.getOrElse {
-      throw IOException("This phone doesn't have Google Play services, which the cut-out tool needs.", it)
+      throw CutoutUnavailable("This phone doesn't have Google Play services, which the cut-out tool needs", it)
     }
     if (available) return
-    withTimeout(180_000L) {
+    try {
+      waitForInstall(client, segmenter, onStatus)
+    } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+      throw CutoutUnavailable("The cut-out tool took too long to download", e)
+    }
+  }
+
+  private suspend fun waitForInstall(
+    client: com.google.android.gms.common.moduleinstall.ModuleInstallClient,
+    segmenter: com.google.android.gms.common.api.OptionalModuleApi,
+    onStatus: (String, Float) -> Unit,
+  ) {
+    withTimeout(120_000L) {
       suspendCancellableCoroutine { cont ->
         lateinit var listener: InstallStatusListener
         listener = InstallStatusListener { update ->
@@ -94,7 +112,7 @@ class DepthPhotoMaker(private val context: Context, private val repo: ProjectRep
             }
             ModuleInstallStatusUpdate.InstallState.STATE_FAILED, ModuleInstallStatusUpdate.InstallState.STATE_CANCELED -> {
               client.unregisterListener(listener)
-              if (cont.isActive) cont.resumeWithException(IOException("Couldn't download the cut-out tool. Check your internet and try again."))
+              if (cont.isActive) cont.resumeWithException(CutoutUnavailable("The cut-out tool couldn't be downloaded"))
             }
             else -> Unit
           }
@@ -109,7 +127,7 @@ class DepthPhotoMaker(private val context: Context, private val repo: ProjectRep
           }
           .addOnFailureListener { e ->
             client.unregisterListener(listener)
-            if (cont.isActive) cont.resumeWithException(IOException("Couldn't get the cut-out tool: ${e.message}", e))
+            if (cont.isActive) cont.resumeWithException(CutoutUnavailable("The cut-out tool couldn't be downloaded", e))
           }
         cont.invokeOnCancellation { client.unregisterListener(listener) }
       }
@@ -126,6 +144,10 @@ class DepthPhotoMaker(private val context: Context, private val repo: ProjectRep
   } catch (e: Exception) {
     throw IOException("This image could not be opened", e)
   }
+
+  /** For tests: runs the cut-out and fill steps on a given mask (the real mask comes from ML Kit). */
+  @androidx.annotation.VisibleForTesting
+  internal fun buildForTest(photo: Bitmap, conf: FloatArray, label: String): DepthPhoto = build(photo, conf, label)
 
   private fun build(photo: Bitmap, conf: FloatArray, label: String): DepthPhoto {
     val w = photo.width
@@ -213,6 +235,30 @@ class DepthPhotoMaker(private val context: Context, private val repo: ProjectRep
         text = TextSpec(text = "{time}", size = 0.14f, font = TextFont.LIGHT, shadow = true),
       )
       return if (withClock) listOf(bg, clock, subject) else listOf(bg, subject)
+    }
+
+    /**
+     * Works on any phone: the photo as a rounded card floating over a blurred copy of itself,
+     * leaning with tilt. Used when the subject can't be cut out.
+     */
+    fun cardLayers(photo: Asset, withClock: Boolean): List<Layer> {
+      val bg = Layer(
+        id = Ids.new("l"), name = "Blurred background", assetId = photo.id,
+        effects = Effects(blur = 0.55f, brightness = -0.2f, saturation = 1.15f),
+        motion = Motion(swipeDepth = 0.03f, tiltDepth = 0.02f),
+      )
+      val card = Layer(
+        id = Ids.new("l"), name = "Photo card", assetId = photo.id, fit = io.github.rdilipkumar.livewallpapermaker.engine.model.Fit.CONTAIN,
+        mask = io.github.rdilipkumar.livewallpapermaker.engine.model.MaskShape.ROUNDED, maskFeather = 0.04f,
+        transform = Transform(scale = 0.86f, y = 0.04f),
+        motion = Motion(swipeDepth = 0.06f, tiltDepth = 0.07f, preset = MotionPreset.FLOAT, presetAmount = 0.35f, presetPeriodSec = 7f),
+      )
+      val clock = Layer(
+        id = Ids.new("l"), name = "Clock", type = LayerType.TEXT,
+        transform = Transform(y = -0.36f), motion = Motion(tiltDepth = 0.09f, swipeDepth = 0.08f),
+        text = TextSpec(text = "{time}", size = 0.11f, font = TextFont.LIGHT, shadow = true),
+      )
+      return if (withClock) listOf(bg, card, clock) else listOf(bg, card)
     }
   }
 }

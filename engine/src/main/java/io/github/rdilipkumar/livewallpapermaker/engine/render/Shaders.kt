@@ -300,7 +300,7 @@ uniform float uFade;
 out vec4 fragColor;
 void main() {
   float d = length(vUv - 0.5) * 2.0;
-  float a = exp(-d * d * 4.0) * (1.0 - smoothstep(0.85, 1.0, d)) * uFade * uColor.a;
+  float a = min(1.0, exp(-d * d * 4.0) + 0.7 * exp(-d * d * 40.0)) * (1.0 - smoothstep(0.85, 1.0, d)) * uFade * uColor.a;
   fragColor = vec4(uColor.rgb * a, a);
 }
 """

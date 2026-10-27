@@ -91,7 +91,9 @@ fun HomeScreen(vm: MainViewModel) {
   val scope = rememberCoroutineScope()
   var confirmDelete by remember { mutableStateOf<ProjectSummary?>(null) }
 
-  LaunchedEffect(Unit) { vm.messages.collect { snackbar.showSnackbar(it) } }
+  LaunchedEffect(Unit) {
+    vm.messages.collect { snackbar.showSnackbar(it, duration = if (it.length > 60) androidx.compose.material3.SnackbarDuration.Long else androidx.compose.material3.SnackbarDuration.Short) }
+  }
 
   val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
     if (uri != null) vm.importProject(uri)

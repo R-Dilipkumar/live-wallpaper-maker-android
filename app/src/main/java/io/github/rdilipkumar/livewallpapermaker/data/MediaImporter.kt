@@ -245,9 +245,16 @@ class MediaImporter(private val context: Context, private val repo: ProjectRepos
 
   private fun writeThumb(id: String, bmp: Bitmap) {
     val s = 240f / max(bmp.width, bmp.height)
-    val small = Bitmap.createScaledBitmap(bmp, max(1, (bmp.width * s).roundToInt()), max(1, (bmp.height * s).roundToInt()), true)
-    thumbFile(id).outputStream().use { small.compress(Bitmap.CompressFormat.JPEG, 85, it) }
-    if (small !== bmp) small.recycle()
+    val w = max(1, (bmp.width * s).roundToInt())
+    val h = max(1, (bmp.height * s).roundToInt())
+    // Thumbnails are JPEGs; put see-through pictures on the app's dark grey instead of black.
+    val thumb = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+    android.graphics.Canvas(thumb).apply {
+      drawColor(0xFF2A2E3A.toInt())
+      drawBitmap(bmp, null, android.graphics.Rect(0, 0, w, h), android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG))
+    }
+    thumbFile(id).outputStream().use { thumb.compress(Bitmap.CompressFormat.JPEG, 85, it) }
+    thumb.recycle()
   }
 
   private fun videoThumb(id: String, file: File) {

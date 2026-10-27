@@ -299,8 +299,8 @@ internal class Painter {
     val pose = Pose(t.x, t.y, r * 2f, r * 2f, 0f, 1f)
     GLES30.glUseProgram(glow)
     GLES30.glUniformMatrix4fv(loc(glow, "uMvp"), 1, false, poseMatrix(pose), 0)
-    GLES30.glUniform4f(loc(glow, "uColor"), Color.red(color) / 255f, Color.green(color) / 255f, Color.blue(color) / 255f, 0.85f)
-    GLES30.glUniform1f(loc(glow, "uFade"), (1f - t.age) * (1f - t.age))
+    GLES30.glUniform4f(loc(glow, "uColor"), Color.red(color) / 255f, Color.green(color) / 255f, Color.blue(color) / 255f, 1f)
+    GLES30.glUniform1f(loc(glow, "uFade"), Math.pow((1.0 - t.age), 1.4).toFloat())
     setBlend(BlendMode.ADD)
     quad.draw()
   }

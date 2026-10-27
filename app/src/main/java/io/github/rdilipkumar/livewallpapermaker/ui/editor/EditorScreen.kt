@@ -138,7 +138,9 @@ fun EditorScreen(vm: MainViewModel) {
   val scene = project.scenes.firstOrNull { it.id == sceneId } ?: project.scenes.firstOrNull()
   val layer = scene?.layers?.firstOrNull { it.id == layerId }
 
-  LaunchedEffect(Unit) { vm.messages.collect { snackbar.showSnackbar(it) } }
+  LaunchedEffect(Unit) {
+    vm.messages.collect { snackbar.showSnackbar(it, duration = if (it.length > 60) androidx.compose.material3.SnackbarDuration.Long else androidx.compose.material3.SnackbarDuration.Short) }
+  }
   LaunchedEffect(playAsWallpaper) { controller.renderer.setAutoScenes(playAsWallpaper) }
   val shown = remember(project, playAsWallpaper) { if (playAsWallpaper) project else project.forEditing() }
   // Leaving the editor saves the current preview as the project's thumbnail.

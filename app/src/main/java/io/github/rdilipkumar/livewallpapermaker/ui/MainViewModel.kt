@@ -6,7 +6,9 @@ import android.net.Uri
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import io.github.rdilipkumar.livewallpapermaker.data.CutoutUnavailable
 import io.github.rdilipkumar.livewallpapermaker.data.DepthPhotoMaker
+import io.github.rdilipkumar.livewallpapermaker.data.NoSubjectFound
 import io.github.rdilipkumar.livewallpapermaker.data.Ids
 import io.github.rdilipkumar.livewallpapermaker.data.Templates
 import io.github.rdilipkumar.livewallpapermaker.engine.model.Fit
@@ -382,13 +384,30 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         getApplication<Application>().contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
           ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
       }.getOrNull()?.takeIf { n -> !n.substringBeforeLast('.').all { it.isDigit() } } ?: "Photo"
-      val photo = depthMaker.make(uri, label) { status, p -> _importJob.value = ImportJob(status, p) }
       val scene = currentScene ?: return@runImport
-      val layers = DepthPhotoMaker.layers(photo, withClock)
-      edit(null) { it.copy(assets = it.assets + photo.background + photo.subject) }
-      updateScene(scene.id, null) { it.copy(layers = it.layers + layers) }
-      selectedLayerId.value = layers.last().id
-      say("3D photo ready. Tilt your phone or move the slider to see the depth.")
+      try {
+        val photo = depthMaker.make(uri, label) { status, p -> _importJob.value = ImportJob(status, p) }
+        val layers = DepthPhotoMaker.layers(photo, withClock)
+        edit(null) { it.copy(assets = it.assets + photo.background + photo.subject) }
+        updateScene(scene.id, null) { it.copy(layers = it.layers + layers) }
+        selectedLayerId.value = layers.last().id
+        say("3D photo ready. Tilt your phone or move the slider to see the depth.")
+      } catch (e: CancellationException) {
+        throw e
+      } catch (e: Exception) {
+        // Plan B that works everywhere: a floating photo card.
+        val reason = when (e) {
+          is CutoutUnavailable, is NoSubjectFound -> e.message
+          else -> "The cut-out tool isn't working on this phone"
+        }
+        _importJob.value = ImportJob("Making a 3D card", 0.8f)
+        val asset = importer.importImage(uri, label)
+        val layers = DepthPhotoMaker.cardLayers(asset, withClock)
+        edit(null) { it.copy(assets = it.assets + asset) }
+        updateScene(scene.id, null) { it.copy(layers = it.layers + layers) }
+        selectedLayerId.value = layers[1].id
+        say("$reason, so you got a floating 3D card instead. Tilt to see it.")
+      }
     }
   }
 
@@ -528,7 +547,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
   private fun saveToGallery(file: File, gif: Boolean, name: String): Uri {
     val resolver = getApplication<Application>().contentResolver
-    val clean = name.replace(Regex("[^A-Za-z0-9 _-]"), "").trim().ifEmpty { "Wallpaper" }
+    val clean = name.replace(Regex("[^A-Za-z0-9 _-]"), "").replace(Regex("\\s+"), " ").trim().ifEmpty { "Wallpaper" }
     val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(java.util.Date())
     val values = android.content.ContentValues().apply {
       put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, "$clean $stamp." + if (gif) "gif" else "mp4")
